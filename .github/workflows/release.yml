@@ -1,0 +1,114 @@
+# 推 tag(v*)即发布。设计目标是低维护——本项目预期很少更新:
+# - 只用第一方 action(checkout/upload-artifact/download-artifact),
+#   发布用 runner 预装的 gh CLI,不引入第三方 action;
+# - protoc(buffa-build 的构建期依赖)走各系统包管理器安装;
+# - macOS x86_64 在 arm runner 上交叉编译,不依赖迟早退役的 Intel 镜像;
+# - Linux 产物静态链接(musl),不受用户 glibc 版本限制;
+# - 发布步骤幂等: release 已存在时改为覆盖上传资产,失败可直接重跑。
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  # 在既有 tag 上手动重跑用(Actions 页面选中 tag 触发)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  BIN: cursor-chat-cleanup
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,    target: x86_64-unknown-linux-musl }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
+          - { os: windows-latest,   target: x86_64-pc-windows-msvc }
+          - { os: macos-latest,     target: aarch64-apple-darwin }
+          - { os: macos-latest,     target: x86_64-apple-darwin }
+    env:
+      # Debian 的 musl-tools 只提供 musl-gcc,没有三元组前缀的别名;
+      # 两个 musl 目标都在同架构 runner 上原生构建,直接指过去即可。
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      CC_aarch64_unknown_linux_musl: musl-gcc
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 校验 tag 与 Cargo.toml 版本一致
+        shell: bash
+        run: |
+          ver="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)"
+          if [ "$GITHUB_REF_NAME" != "v$ver" ]; then
+            echo "::error::tag $GITHUB_REF_NAME 与 Cargo.toml 版本 v$ver 不一致"
+            exit 1
+          fi
+
+      - name: 安装 protoc (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler musl-tools
+
+      - name: 安装 protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: 安装 protoc (Windows)
+        if: runner.os == 'Windows'
+        run: choco install protoc -y
+
+      - name: 构建
+        shell: bash
+        run: |
+          rustup target add ${{ matrix.target }}
+          cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: 打包
+        shell: bash
+        run: |
+          name="${BIN}-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir "$name"
+          cp README.md LICENSE-MIT LICENSE-APACHE "$name"/
+          case "${{ runner.os }}" in
+            Windows)
+              cp "target/${{ matrix.target }}/release/${BIN}.exe" "$name"/
+              7z a "${name}.zip" "$name"
+              ;;
+            *)
+              cp "target/${{ matrix.target }}/release/${BIN}" "$name"/
+              tar -czf "${name}.tar.gz" "$name"
+              ;;
+          esac
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            *.tar.gz
+            *.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 生成校验和
+        run: cd dist && sha256sum * > SHA256SUMS
+
+      - name: 创建 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" --generate-notes --verify-tag dist/* \
+          || gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber dist/*
