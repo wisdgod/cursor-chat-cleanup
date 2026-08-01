@@ -97,18 +97,32 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      # 资产校验和不随附文件: GitHub 已为每个 release 资产提供 digest 字段
+      # (gh release view --json assets / REST API 均可读取 sha256)。
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # 生成上个 tag 以来的提交列表需要完整历史
+
       - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
 
-      - name: 生成校验和
-        run: cd dist && sha256sum * > SHA256SUMS
+      - name: 生成 Release 说明
+        run: |
+          prev="$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)"
+          {
+            echo "## 变更"
+            git log --no-merges --format='- %s (%h)' ${prev:+"${prev}.."}"${GITHUB_REF_NAME}"
+            echo
+          } > notes.md
 
       - name: 创建 Release
         env:
           GH_TOKEN: ${{ github.token }}
+        # --notes-file 会被置于自动生成内容(新贡献者、Full Changelog 链接)之前
         run: |
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-            --title "$GITHUB_REF_NAME" --generate-notes --verify-tag dist/* \
+            --title "${BIN} ${GITHUB_REF_NAME}" \
+            --notes-file notes.md --generate-notes --verify-tag dist/* \
           || gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber dist/*
