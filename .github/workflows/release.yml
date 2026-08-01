@@ -49,9 +49,11 @@ jobs:
             exit 1
           fi
 
+      # libprotobuf-dev 提供 well-known types(struct/empty.proto),
+      # Debian/Ubuntu 把它们与编译器拆成了两个包
       - name: 安装 protoc (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler musl-tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev musl-tools
 
       - name: 安装 protoc (macOS)
         if: runner.os == 'macOS'

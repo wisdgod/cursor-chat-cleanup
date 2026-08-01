@@ -4,11 +4,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root = "proto";
     println!("cargo:rerun-if-changed=proto");
 
-    let files: Vec<_> = walkdir::WalkDir::new(root)
+    // 统一正斜杠: Windows 上 walkdir 产出反斜杠路径,剥掉 include 前缀后
+    // 与 descriptor set 里的正斜杠文件名对不上,codegen 会报 FileNotFound。
+    let files: Vec<String> = walkdir::WalkDir::new(root)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.path().extension().is_some_and(|x| x == "proto"))
-        .map(|e| e.into_path())
+        .map(|e| e.path().to_string_lossy().replace('\\', "/"))
         .collect();
 
     // buffa-build 的全部全局开关在此显式固定,包括与当前默认值一致的项:
