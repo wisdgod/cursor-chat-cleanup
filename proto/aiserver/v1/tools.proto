@@ -1,0 +1,53 @@
+syntax = "proto3";
+
+package aiserver.v1;
+
+import "aiserver/v1/utils.proto";
+
+message EditFileV2Result {
+  optional string contents_before_edit = 1;
+  optional string eol_sequence = 9;
+  optional string detected_language = 11;
+  bool file_was_created = 2;
+  optional EditFileResult.FileDiff diff = 3;
+  optional bool rejected = 4;
+  repeated LinterError linter_errors = 5;
+  bool sent_back_linter_errors = 6;
+  bool should_auto_fix_lints = 8;
+  optional HumanReview human_review_v2 = 7;
+  string result_for_model = 10;
+  optional string contents_after_edit = 12;
+  optional string before_content_id = 13;
+  string after_content_id = 14;
+}
+
+message EditFileResult {
+  message FileDiff {
+    enum Editor {
+      EDITOR_UNSPECIFIED = 0;
+      EDITOR_AI = 1;
+      EDITOR_HUMAN = 2;
+    }
+    message ChunkDiff {
+      string diff_string = 1;
+      int32 old_start = 2;
+      int32 new_start = 3;
+      int32 old_lines = 4;
+      int32 new_lines = 5;
+      int32 lines_removed = 6;
+      int32 lines_added = 7;
+    }
+    repeated ChunkDiff chunks = 1;
+    Editor editor = 2;
+    bool hit_timeout = 3;
+  }
+
+  reserved 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17;
+}
+
+message HumanReview {
+  string selected_option = 1;
+  string feedback_text = 2;
+  bool submit_feedback_as_new_message = 3;
+  string bubble_id = 4;
+}

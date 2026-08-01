@@ -1,0 +1,50 @@
+[package]
+name = "cursor-chat-cleanup"
+version = "0.1.0"
+edition = "2024"
+authors = ["wisdgod <nav@wisdgod.com>"]
+license = "MIT OR Apache-2.0"
+description = "TUI tool to analyze and clean up Cursor's local chat storage"
+repository = "https://github.com/wisdgod/cursor-chat-cleanup"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.23"
+buffa = "0.9"
+buffa-types = "0.9"
+bytes = "1"
+bytesize = "2"
+clap = { version = "4.6", features = ["derive"] }
+crossterm = "0.29"
+dirs = "6"
+faster-hex = "0.10"
+jiff = "0.2"
+memchr = "2"
+rayon = "1.12"
+ratatui = "0.30"
+rusqlite = { version = "0.40", features = ["bundled", "hooks"] }
+rustc-hash = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[build-dependencies]
+buffa-build = "0.9"
+walkdir = "2"
+
+# O0 下 protobuf 解码与全表扫描慢到影响调试与测试;本 crate 自身保持 O1
+# 以兼顾编译速度,不常变的依赖(含 bundled SQLite 的 C 代码)直接开满。
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+# 构建脚本一侧(buffa-build/protoc 调用与代码生成)同样受益。
+[profile.dev.build-override]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

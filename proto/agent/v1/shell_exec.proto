@@ -1,0 +1,185 @@
+syntax = "proto3";
+
+package agent.v1;
+
+import "agent/v1/sandbox.proto";
+import "agent/v1/utils.proto";
+
+enum TimeoutBehavior {
+  TIMEOUT_BEHAVIOR_UNSPECIFIED = 0;
+  TIMEOUT_BEHAVIOR_CANCEL = 1;
+  TIMEOUT_BEHAVIOR_BACKGROUND = 2;
+}
+
+enum ShellBackgroundReason {
+  SHELL_BACKGROUND_REASON_UNSPECIFIED = 0;
+  SHELL_BACKGROUND_REASON_TIMEOUT = 1;
+  SHELL_BACKGROUND_REASON_USER_REQUEST = 2;
+}
+
+enum ShellAbortReason {
+  SHELL_ABORT_REASON_UNSPECIFIED = 0;
+  SHELL_ABORT_REASON_USER_ABORT = 1;
+  SHELL_ABORT_REASON_TIMEOUT = 2;
+}
+
+message ShellCommandParsingResult {
+  message ExecutableCommandArg {
+    string type = 1;
+    string value = 2;
+  }
+  message ExecutableCommand {
+    string name = 1;
+    repeated ExecutableCommandArg args = 2;
+    string full_text = 3;
+  }
+  message Redirect {
+    string operator = 1;
+    repeated uint32 destination_fds = 2;
+    string target_node_type = 3;
+    optional string target_text = 4;
+  }
+  bool parsing_failed = 1;
+  repeated ExecutableCommand executable_commands = 2;
+  bool has_redirects = 3;
+  bool has_command_substitution = 4;
+  optional bool all_redirects_are_dev_null = 5;
+  repeated Redirect redirects = 6;
+}
+
+message CommandClassifierResult {
+  enum SuggestedSandboxMode {
+    SUGGESTED_SANDBOX_MODE_UNSPECIFIED = 0;
+    SUGGESTED_SANDBOX_MODE_SANDBOX = 1;
+    SUGGESTED_SANDBOX_MODE_NO_SANDBOX = 2;
+    SUGGESTED_SANDBOX_MODE_UNDETERMINED = 3;
+  }
+  message ClassifiedCommand {
+    string name = 1;
+    repeated string arguments = 2;
+    optional string suggested_allowlist_entry = 3;
+    repeated string subcommand_tokens = 4;
+  }
+  repeated ClassifiedCommand commands = 1;
+  SuggestedSandboxMode suggested_sandbox_mode = 2;
+  bool classification_failed = 3;
+}
+
+message ShellOutputNotificationConfig {
+  string pattern = 1;
+  string reason = 2;
+  optional double debounce = 3;
+  optional int32 notification_limit = 4;
+}
+
+message ShellHookApprovalRequirement {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_FORCE_PROMPT = 1;
+  }
+  Kind kind = 1;
+  optional string reason = 2;
+}
+
+message ShellArgs {
+  string command = 1;
+  string working_directory = 2;
+  int32 timeout = 3;
+  string tool_call_id = 4;
+  repeated string simple_commands = 5;
+  bool has_input_redirect = 6;
+  bool has_output_redirect = 7;
+  ShellCommandParsingResult parsing_result = 8;
+  optional SandboxPolicy requested_sandbox_policy = 9;
+  optional uint64 file_output_threshold_bytes = 10;
+  bool is_background = 11;
+  bool skip_approval = 12;
+  TimeoutBehavior timeout_behavior = 13;
+  optional int32 hard_timeout = 14;
+  optional string description = 15;
+  optional CommandClassifierResult classifier_result = 16;
+  bool close_stdin = 17;
+  optional ShellOutputNotificationConfig output_notification = 18;
+  optional SmartModeApproval smart_mode_approval = 19;
+  optional ShellHookApprovalRequirement hook_approval_requirement = 20;
+  optional string conversation_id = 21;
+}
+
+message ShellResult {
+  optional SandboxPolicy sandbox_policy = 101;
+  optional bool is_background = 102;
+  optional string terminals_folder = 103;
+  optional uint32 pid = 104;
+  oneof result {
+    ShellSuccess success = 1;
+    ShellFailure failure = 2;
+    ShellTimeout timeout = 3;
+    ShellRejected rejected = 4;
+    ShellSpawnError spawn_error = 5;
+    ShellPermissionDenied permission_denied = 7;
+  }
+}
+
+message ShellSuccess {
+  string command = 1;
+  string working_directory = 2;
+  int32 exit_code = 3;
+  string signal = 4;
+  string stdout = 5;
+  string stderr = 6;
+  int32 execution_time = 7;
+  optional OutputLocation output_location = 8;
+  optional uint32 shell_id = 9;
+  optional string interleaved_output = 10;
+  optional uint32 pid = 11;
+  optional int32 ms_to_wait = 12;
+  optional int32 local_execution_time_ms = 13;
+  optional ShellBackgroundReason background_reason = 14;
+  optional string output_head = 15;
+  optional string output_tail = 16;
+  optional uint32 elided_chars = 17;
+}
+
+message ShellFailure {
+  string command = 1;
+  string working_directory = 2;
+  int32 exit_code = 3;
+  string signal = 4;
+  string stdout = 5;
+  string stderr = 6;
+  int32 execution_time = 7;
+  optional OutputLocation output_location = 8;
+  optional string interleaved_output = 9;
+  optional ShellAbortReason abort_reason = 10;
+  bool aborted = 11;
+  optional int32 local_execution_time_ms = 12;
+  optional string output_head = 13;
+  optional string output_tail = 14;
+  optional uint32 elided_chars = 15;
+}
+
+message ShellTimeout {
+  string command = 1;
+  string working_directory = 2;
+  int32 timeout_ms = 3;
+}
+
+message ShellRejected {
+  string command = 1;
+  string working_directory = 2;
+  string reason = 3;
+  bool is_readonly = 4;
+}
+
+message ShellPermissionDenied {
+  string command = 1;
+  string working_directory = 2;
+  string error = 3;
+  bool is_readonly = 4;
+}
+
+message ShellSpawnError {
+  string command = 1;
+  string working_directory = 2;
+  string error = 3;
+}

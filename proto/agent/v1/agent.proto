@@ -1,0 +1,568 @@
+syntax = "proto3";
+
+package agent.v1;
+
+import "agent/v1/ai_attribution_tool.proto";
+import "agent/v1/apply_agent_diff_tool.proto";
+import "agent/v1/ask_question_tool.proto";
+import "agent/v1/await_tool.proto";
+import "agent/v1/blame_by_file_path_tool.proto";
+import "agent/v1/communicate_update_tool.proto";
+import "agent/v1/computer_use_tool.proto";
+import "agent/v1/connect_scm_tool.proto";
+import "agent/v1/create_plan_tool.proto";
+import "agent/v1/delete_tool.proto";
+import "agent/v1/edit_pr_labels_tool.proto";
+import "agent/v1/edit_tool.proto";
+import "agent/v1/fetch_cloud_agent_data_tool.proto";
+import "agent/v1/fetch_tool.proto";
+import "agent/v1/generate_image_tool.proto";
+import "agent/v1/get_mcp_tools_tool.proto";
+import "agent/v1/glob_tool.proto";
+import "agent/v1/grep_tool.proto";
+import "agent/v1/hook_additional_context.proto";
+import "agent/v1/ls_tool.proto";
+
+import "agent/v1/mcp_auth_tool.proto";
+import "agent/v1/mcp_resource_tool.proto";
+import "agent/v1/mcp_tool.proto";
+import "agent/v1/pi_bash_tool.proto";
+import "agent/v1/pi_edit_tool.proto";
+import "agent/v1/pi_find_tool.proto";
+import "agent/v1/pi_grep_tool.proto";
+import "agent/v1/pi_ls_tool.proto";
+import "agent/v1/pi_read_tool.proto";
+import "agent/v1/pi_write_tool.proto";
+import "agent/v1/pr_management_tool.proto";
+import "agent/v1/read_lints_tool.proto";
+import "agent/v1/read_tool.proto";
+import "agent/v1/record_ci_investigation_findings_tool.proto";
+import "agent/v1/record_screen_tool.proto";
+import "agent/v1/reflect_tool.proto";
+import "agent/v1/replace_env_tool.proto";
+import "agent/v1/report_bug_tool.proto";
+import "agent/v1/report_bugfix_results_tool.proto";
+
+import "agent/v1/search_conversations_tool.proto";
+import "agent/v1/selected_context.proto";
+import "agent/v1/semsearch_tool.proto";
+import "agent/v1/send_final_summary_tool.proto";
+import "agent/v1/send_message_tool.proto";
+import "agent/v1/send_to_user_tool.proto";
+import "agent/v1/setup_vm_environment_tool.proto";
+
+import "agent/v1/shell_tool.proto";
+import "agent/v1/start_grind_execution_tool.proto";
+import "agent/v1/start_grind_planning_tool.proto";
+import "agent/v1/subagents.proto";
+import "agent/v1/switch_mode_tool.proto";
+import "agent/v1/todo_tool.proto";
+import "agent/v1/update_pr_code_tour_tool.proto";
+import "agent/v1/web_fetch_tool.proto";
+import "agent/v1/web_search_tool.proto";
+import "agent/v1/write_shell_stdin_tool.proto";
+
+enum AgentMode {
+  AGENT_MODE_UNSPECIFIED = 0;
+  AGENT_MODE_AGENT = 1;
+  AGENT_MODE_ASK = 2;
+  AGENT_MODE_PLAN = 3;
+  AGENT_MODE_DEBUG = 4;
+  AGENT_MODE_TRIAGE = 5;
+  AGENT_MODE_PROJECT = 6;
+  AGENT_MODE_MULTITASK = 7;
+  AGENT_MODE_CUSTOM = 8;
+}
+
+enum SubagentExecutionEnvironment {
+  SUBAGENT_EXECUTION_ENVIRONMENT_UNSPECIFIED = 0;
+  SUBAGENT_EXECUTION_ENVIRONMENT_LOCAL = 1;
+  SUBAGENT_EXECUTION_ENVIRONMENT_CLOUD = 2;
+}
+
+enum SubagentBackgroundReason {
+  SUBAGENT_BACKGROUND_REASON_UNSPECIFIED = 0;
+  SUBAGENT_BACKGROUND_REASON_AGENT_REQUEST = 1;
+  SUBAGENT_BACKGROUND_REASON_USER_REQUEST = 2;
+  SUBAGENT_BACKGROUND_REASON_QUEUED_FOLLOW_UP = 3;
+}
+
+enum BackgroundTaskCompletionReason {
+  BACKGROUND_TASK_COMPLETION_REASON_UNSPECIFIED = 0;
+  BACKGROUND_TASK_COMPLETION_REASON_TASK_FINISHED = 1;
+  BACKGROUND_TASK_COMPLETION_REASON_TASK_PROGRESS = 2;
+}
+
+enum SubagentRunStatus {
+  SUBAGENT_RUN_STATUS_UNSPECIFIED = 0;
+  SUBAGENT_RUN_STATUS_RUNNING = 1;
+  SUBAGENT_RUN_STATUS_BACKGROUNDED = 2;
+  SUBAGENT_RUN_STATUS_SUCCESS = 3;
+  SUBAGENT_RUN_STATUS_ERROR = 4;
+  SUBAGENT_RUN_STATUS_ABORTED = 5;
+}
+
+enum CustomModeSource {
+  CUSTOM_MODE_SOURCE_UNSPECIFIED = 0;
+  CUSTOM_MODE_SOURCE_AGENT_SKILL = 1;
+  CUSTOM_MODE_SOURCE_PLUGIN_SKILL = 2;
+  CUSTOM_MODE_SOURCE_REPO_SKILL = 3;
+  CUSTOM_MODE_SOURCE_MANAGED_SKILL = 4;
+}
+
+enum SimulatedMsgReason {
+  SIMULATED_MSG_REASON_UNSPECIFIED = 0;
+  SIMULATED_MSG_REASON_PLAN_EXECUTION = 1;
+  SIMULATED_MSG_REASON_COMMIT_REMINDER = 2;
+  SIMULATED_MSG_REASON_BACKGROUND_TASK_COMPLETION = 3;
+  SIMULATED_MSG_REASON_DIFF_TAB_COMMIT = 4;
+  SIMULATED_MSG_REASON_DIFF_TAB_COMMIT_AND_PUSH = 5;
+  SIMULATED_MSG_REASON_DIFF_TAB_PUSH = 6;
+  SIMULATED_MSG_REASON_DIFF_TAB_CREATE_PR = 7;
+  SIMULATED_MSG_REASON_DIFF_TAB_FIX_MERGE_CONFLICTS = 8;
+  SIMULATED_MSG_REASON_USER_SENT_TO_SUBAGENT = 9;
+  SIMULATED_MSG_REASON_USER_INTERRUPTED_SUBAGENT = 10;
+  SIMULATED_MSG_REASON_USER_QUEUED_TO_SUBAGENT = 11;
+  SIMULATED_MSG_REASON_BABYSIT_PR_IN_CLOUD = 12;
+  SIMULATED_MSG_REASON_CI_PANEL_INVESTIGATE_FAILURE = 13;
+  SIMULATED_MSG_REASON_MULTITASK = 14;
+  SIMULATED_MSG_REASON_BUILD_IN_PARALLEL = 15;
+  SIMULATED_MSG_REASON_MULTITASK_SPLIT_PRS = 16;
+  SIMULATED_MSG_REASON_APPLY_LOCALLY = 17;
+  SIMULATED_MSG_REASON_CHECKOUT_BRANCH = 18;
+  SIMULATED_MSG_REASON_DIFF_TAB_UPDATE_BRANCH = 19;
+  SIMULATED_MSG_REASON_PR_TAB_BUGBOT_FIX = 20;
+  SIMULATED_MSG_REASON_RUN_BUGBOT_REVIEW = 22;
+  SIMULATED_MSG_REASON_RUN_SECURITY_REVIEW = 23;
+  SIMULATED_MSG_REASON_FSD_APPLY_FINDING = 24;
+  SIMULATED_MSG_REASON_FSD_UNDO_FINDING = 25;
+  SIMULATED_MSG_REASON_FSD_START = 26;
+  SIMULATED_MSG_REASON_FSD_PR_INTERRUPT = 27;
+  SIMULATED_MSG_REASON_SUBSCRIPTION = 28;
+  SIMULATED_MSG_REASON_DIFF_TAB_CREATE_BRANCH = 29;
+  SIMULATED_MSG_REASON_AGENT_STORE_CONFLICT = 30;
+}
+
+enum SubscriptionSource {
+  SUBSCRIPTION_SOURCE_UNSPECIFIED = 0;
+  SUBSCRIPTION_SOURCE_SLACK = 1;
+  SUBSCRIPTION_SOURCE_GITHUB = 2;
+}
+
+message TaskArgs {
+  string description = 1;
+  string prompt = 2;
+  SubagentType subagent_type = 3;
+  optional string model = 4;
+  optional string resume = 5;
+  optional string agent_id = 6;
+  repeated string attachments = 7;
+  TaskMode mode = 8;
+  repeated string responding_to_message_ids = 9;
+  SubagentExecutionEnvironment environment = 10;
+}
+
+message TaskSuccess {
+  repeated ConversationStep conversation_steps = 1;
+  optional string agent_id = 2;
+  bool is_background = 3;
+  optional uint64 duration_ms = 4;
+  optional string result_suffix = 5;
+  SubagentBackgroundReason background_reason = 6;
+  optional string transcript_path = 7;
+}
+
+message TaskError {
+  string error = 1;
+}
+
+message TaskResult {
+  oneof result {
+    TaskSuccess success = 1;
+    TaskError error = 2;
+  }
+}
+
+message TaskToolCall {
+  TaskArgs args = 1;
+  TaskResult result = 2;
+}
+
+message SetActiveBranchArgs {
+  string path = 1;
+  string branch_name = 2;
+}
+
+message SetActiveBranchSuccess {}
+
+message SetActiveBranchError {
+  string error = 1;
+}
+
+message SetActiveBranchResult {
+  oneof result {
+    SetActiveBranchSuccess success = 1;
+    SetActiveBranchError error = 2;
+  }
+}
+
+message SetActiveBranchToolCall {
+  SetActiveBranchArgs args = 1;
+  SetActiveBranchResult result = 2;
+}
+
+message ToolCall {
+  repeated HookAdditionalContext hook_additional_contexts = 54;
+  optional string tool_call_id = 57;
+  optional uint64 started_at_ms = 59;
+  optional uint64 completed_at_ms = 60;
+  oneof tool {
+    ShellToolCall shell_tool_call = 1;
+    DeleteToolCall delete_tool_call = 3;
+    GlobToolCall glob_tool_call = 4;
+    GrepToolCall grep_tool_call = 5;
+    ReadToolCall read_tool_call = 8;
+    UpdateTodosToolCall update_todos_tool_call = 9;
+    ReadTodosToolCall read_todos_tool_call = 10;
+    EditToolCall edit_tool_call = 12;
+    LsToolCall ls_tool_call = 13;
+    ReadLintsToolCall read_lints_tool_call = 14;
+    McpToolCall mcp_tool_call = 15;
+    SemSearchToolCall sem_search_tool_call = 16;
+    CreatePlanToolCall create_plan_tool_call = 17;
+    WebSearchToolCall web_search_tool_call = 18;
+    TaskToolCall task_tool_call = 19;
+    ListMcpResourcesToolCall list_mcp_resources_tool_call = 20;
+    ReadMcpResourceToolCall read_mcp_resource_tool_call = 21;
+    ApplyAgentDiffToolCall apply_agent_diff_tool_call = 22;
+    AskQuestionToolCall ask_question_tool_call = 23;
+    FetchToolCall fetch_tool_call = 24;
+    SwitchModeToolCall switch_mode_tool_call = 25;
+    GenerateImageToolCall generate_image_tool_call = 28;
+    RecordScreenToolCall record_screen_tool_call = 29;
+    ComputerUseToolCall computer_use_tool_call = 30;
+    WriteShellStdinToolCall write_shell_stdin_tool_call = 31;
+    ReflectToolCall reflect_tool_call = 32;
+    SetupVmEnvironmentToolCall setup_vm_environment_tool_call = 33;
+    TruncatedToolCall truncated_tool_call = 34;
+    StartGrindExecutionToolCall start_grind_execution_tool_call = 35;
+    StartGrindPlanningToolCall start_grind_planning_tool_call = 36;
+    WebFetchToolCall web_fetch_tool_call = 37;
+    ReportBugfixResultsToolCall report_bugfix_results_tool_call = 38;
+    AiAttributionToolCall ai_attribution_tool_call = 39;
+    PrManagementToolCall pr_management_tool_call = 40;
+    McpAuthToolCall mcp_auth_tool_call = 41;
+    AwaitToolCall await_tool_call = 42;
+    BlameByFilePathToolCall blame_by_file_path_tool_call = 43;
+    GetMcpToolsToolCall get_mcp_tools_tool_call = 44;
+    ReportBugToolCall report_bug_tool_call = 45;
+    SetActiveBranchToolCall set_active_branch_tool_call = 46;
+    CommunicateUpdateToolCall communicate_update_tool_call = 48;
+    SendFinalSummaryToolCall send_final_summary_tool_call = 49;
+    UpdatePrCodeTourToolCall update_pr_code_tour_tool_call = 50;
+    ReplaceEnvToolCall replace_env_tool_call = 51;
+    EditPrLabelsToolCall edit_pr_labels_tool_call = 52;
+    RecordCiInvestigationFindingsToolCall record_ci_investigation_findings_tool_call = 53;
+    SendMessageToolCall send_message_tool_call = 55;
+    FetchCloudAgentDataToolCall fetch_cloud_agent_data_tool_call = 56;
+    SendToUserToolCall send_to_user_tool_call = 58;
+    PiReadToolCall pi_read_tool_call = 61;
+    PiBashToolCall pi_bash_tool_call = 62;
+    PiEditToolCall pi_edit_tool_call = 63;
+    PiWriteToolCall pi_write_tool_call = 64;
+    PiGrepToolCall pi_grep_tool_call = 65;
+    PiFindToolCall pi_find_tool_call = 66;
+    PiLsToolCall pi_ls_tool_call = 67;
+    ConnectScmToolCall connect_scm_tool_call = 68;
+    SearchConversationsToolCall search_conversations_tool_call = 69;
+  }
+}
+
+message TruncatedToolCallArgs {}
+
+message TruncatedToolCallSuccess {}
+
+message TruncatedToolCallError {
+  string error = 1;
+}
+
+message TruncatedToolCallResult {
+  oneof result {
+    TruncatedToolCallSuccess success = 1;
+    TruncatedToolCallError error = 2;
+  }
+}
+
+message TruncatedToolCall {
+  bytes original_step_blob_id = 1;
+  TruncatedToolCallArgs args = 2;
+  TruncatedToolCallResult result = 3;
+}
+
+message ConversationStep {
+  oneof message {
+    AssistantMessage assistant_message = 1;
+    ToolCall tool_call = 2;
+    ThinkingMessage thinking_message = 3;
+  }
+}
+
+message TriggeringUserInfo {
+  optional string auth_id = 1;
+  optional int32 user_id = 2;
+}
+
+message SubagentRunState {
+  string parent_tool_call_id = 1;
+  optional string subagent_id = 2;
+  SubagentExecutionEnvironment environment = 3;
+  SubagentRunStatus status = 4;
+  optional string title = 5;
+  optional string detail = 6;
+  optional string transcript_path = 7;
+  optional string output_path = 8;
+  optional uint64 completed_timestamp_ms = 9;
+  optional BackgroundTaskCompletionReason completion_reason = 10;
+}
+
+message SubmittedCustomMode {
+  string id = 1;
+  string label = 2;
+  CustomModeSource source = 5;
+  optional string source_path = 6;
+  optional string source_hash = 7;
+  optional string managed_skill_id = 10;
+  optional string plugin_id = 11;
+  optional string plugin_snapshot_token = 12;
+}
+
+message SubmittedExitedCustomMode {
+  string id = 1;
+  string label = 2;
+}
+
+message CustomModeExitIntent {
+  AgentMode next_mode = 1;
+  SubmittedExitedCustomMode exited_mode = 2;
+}
+
+message CustomModeIntent {
+  oneof intent {
+    SubmittedCustomMode enter = 1;
+    CustomModeExitIntent exit = 2;
+  }
+}
+
+message ExecutePlanInfo {
+  string plan_id = 1;
+  string plan_title = 2;
+}
+
+message ProjectDetails {
+  optional string name = 1;
+  optional ProjectSubagentDetails subagent = 2;
+  optional ProjectSideChatDetails side_chat = 3;
+}
+
+message ProjectSubagentDetails {
+  string report_dir = 1;
+  optional string store_dir = 2;
+}
+
+message ProjectSideChatDetails {
+  string store_dir = 1;
+}
+
+message UserMessage {
+  message SimulatedMessageMetadata {
+    optional string title = 1;
+    optional string task_id = 2;
+    optional string fsd_finding_action = 3;
+    optional string url = 4;
+    optional SubscriptionSource subscription_source = 5;
+  }
+  string text = 1;
+  string message_id = 2;
+  optional SelectedContext selected_context = 3;
+  AgentMode mode = 4;
+  optional bool is_simulated_msg = 5;
+  optional string best_of_n_group_id = 6;
+  optional bool try_use_best_of_n_promotion = 7;
+  optional string rich_text = 8;
+  optional SimulatedMsgReason simulated_msg_reason = 9;
+  bytes conversation_state_blob_id = 10;
+  optional string subagent_system_reminder = 11;
+  optional TriggeringUserInfo triggering_user_info = 13;
+  optional ExecutePlanInfo execute_plan_info = 14;
+  optional SimulatedMessageMetadata simulated_message_metadata = 15;
+  optional string prompt_reference_id = 16;
+  optional string thread_id = 17;
+  optional bytes text_blob_id = 18;
+  optional bytes rich_text_blob_id = 19;
+  repeated HookAdditionalContext hook_additional_contexts = 21;
+  optional CustomModeIntent custom_mode_intent = 22;
+  optional ProjectDetails project_details = 23;
+}
+
+message AssistantMessage {
+  string text = 1;
+}
+
+message ThinkingMessage {
+  string text = 1;
+  uint32 duration_ms = 2;
+}
+
+message PlanRegistryEntry {
+  string id = 1;
+  string path = 2;
+}
+
+message ConversationTurnStructure {
+  oneof turn {
+    AgentConversationTurnStructure agent_conversation_turn = 1;
+    ShellConversationTurnStructure shell_conversation_turn = 2;
+  }
+}
+
+message AgentConversationTurnStructure {
+  bytes user_message = 1;
+  repeated bytes steps = 2;
+  optional string request_id = 3;
+  optional string encrypted_model = 4;
+  optional uint32 dynamic_tool_count = 5;
+}
+
+message ShellConversationTurnStructure {
+  bytes shell_command = 1;
+  bytes shell_output = 2;
+}
+
+message ConversationSummaryArchive {
+  repeated bytes summarized_messages = 1;
+  string summary = 2;
+  uint32 window_tail = 3;
+  bytes summary_message = 4;
+}
+
+message PromptTokenBreakdownCategory {
+  string id = 1;
+  string label = 2;
+  uint32 estimated_tokens = 3;
+  optional uint32 character_count = 4;
+}
+
+message PromptTokenBreakdownSnapshot {
+  uint32 total_used_tokens = 1;
+  uint32 max_tokens = 2;
+  repeated PromptTokenBreakdownCategory categories = 3;
+}
+
+message PromptContextSourceRef {
+  string source_type = 1;
+  uint32 message_index = 3;
+  string content_path = 4;
+  uint32 start_offset = 5;
+  uint32 end_offset = 6;
+}
+
+message PromptContextNode {
+  string id = 1;
+  optional string parent_id = 2;
+  string kind = 3;
+  string label = 4;
+  string category_id = 5;
+  uint32 estimated_tokens = 6;
+  uint32 character_count = 7;
+  bool content_available = 9;
+  optional PromptContextSourceRef source = 11;
+  optional string inline_content = 12;
+}
+
+message PromptContextUsageTree {
+  uint32 schema_version = 1;
+  repeated PromptContextNode nodes = 2;
+}
+
+message ConversationTokenDetails {
+  uint32 used_tokens = 1;
+  uint32 max_tokens = 2;
+  optional PromptTokenBreakdownSnapshot breakdown = 3;
+  optional PromptContextUsageTree prompt_context_usage_tree = 4;
+}
+
+message FileStateStructure {
+  optional bytes content = 1;
+  optional bytes initial_content = 2;
+}
+
+message StepTiming {
+  uint64 duration_ms = 1;
+  uint64 timestamp_ms = 2;
+}
+
+message CommunicateUpdateHistoryEntry {
+  string step = 1;
+  uint32 message_index = 3;
+}
+
+message CommunicateUpdateTurnState {
+  repeated CommunicateUpdateHistoryEntry history = 1;
+  optional string final_summary = 2;
+  optional string completed_subtitle = 3;
+}
+
+message SubagentPersistedState {
+  ConversationStateStructure conversation_state = 1;
+  uint64 created_timestamp_ms = 2;
+  uint64 last_used_timestamp_ms = 3;
+  SubagentType subagent_type = 4;
+  optional string model_id = 5;
+  SubagentExecutionEnvironment environment = 6;
+  optional CloudSubagentReference cloud_subagent = 7;
+  optional string first_class_bc_id = 8;
+  optional string cloud_requested_environment_build_id = 9;
+}
+
+message CloudSubagentReference {
+  string bc_id = 1;
+  optional string transcript_path = 2;
+}
+
+message TrackedGitRepo {
+  string repo_path = 1;
+  string branch_name = 2;
+}
+
+message ConversationStateStructure {
+  repeated bytes root_prompt_messages_json = 1;
+  repeated bytes turns = 8;
+  repeated bytes todos = 3;
+  repeated string pending_tool_calls = 4;
+  ConversationTokenDetails token_details = 5;
+  optional bytes summary = 6;
+  optional bytes plan = 7;
+  repeated string previous_workspace_uris = 9;
+  optional AgentMode mode = 10;
+  optional bytes summary_archive = 11;
+  map<string, bytes> file_states = 12;
+  map<string, FileStateStructure> file_states_v2 = 15;
+  repeated bytes summary_archives = 13;
+  repeated StepTiming turn_timings = 14;
+  map<string, SubagentPersistedState> subagent_states = 16;
+  uint32 self_summary_count = 17;
+  repeated string read_paths = 18;
+  optional string active_branch_name = 19;
+  map<string, PlanRegistryEntry> plans = 20;
+  repeated TrackedGitRepo tracked_git_repo_branches = 21;
+  optional string agent_type = 22;
+  repeated CommunicateUpdateHistoryEntry communicate_update_history = 23;
+  map<string, string> subagent_threads = 24;
+  optional string communicate_update_final_summary = 25;
+  optional string communicate_update_completed_subtitle = 28;
+  map<string, CommunicateUpdateTurnState> communicate_update_states_by_parent_tool_call_id = 29;
+  map<string, SubagentRunState> subagent_runs_by_parent_tool_call_id = 30;
+  optional uint64 conversation_started_timestamp_ms = 26;
+  optional string conversation_started_time_zone = 27;
+  map<string, bytes> subagent_state_refs = 31;
+}

@@ -1,0 +1,29 @@
+NOTICE — Protocol Buffer Interface Definitions
+==============================================
+
+The `.proto` files in this directory are interface definitions (protobuf
+message structures: message names, field names, field numbers, and types)
+reconstructed from the observable runtime behavior of the Cursor desktop
+application, for the sole purpose of interoperability: enabling users to
+read and manage their own local chat data stored on their own machines.
+
+1. The authors of this project claim NO copyright over these interface
+   definitions. They are provided as factual descriptions of a
+   serialization format.
+2. The original protocol design belongs to Anysphere, Inc.
+3. These files are NOT covered by the MIT / Apache-2.0 licenses that apply
+   to the rest of this project.
+4. "Cursor" is a trademark of Anysphere, Inc. This project is not
+   affiliated with, sponsored, or endorsed by Anysphere, Inc.
+
+中文说明
+--------
+
+本目录下的 `.proto` 文件是为互操作性(读取和管理用户自己本机上的聊天数据)
+从 Cursor 桌面版可观测的运行时行为中重建的接口描述(消息名、字段名、字段号、
+类型)。
+
+1. 本项目作者对这些接口定义**不主张版权**,它们仅作为序列化格式的事实性描述提供。
+2. 原始协议设计归 Anysphere, Inc. 所有。
+3. 这些文件**不在**本项目其余部分适用的 MIT / Apache-2.0 双许可授权范围内。
+4. Cursor 是 Anysphere, Inc. 的商标。本项目与 Anysphere 无关联,未获其背书。

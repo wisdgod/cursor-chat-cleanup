@@ -1,0 +1,167 @@
+syntax = "proto3";
+
+package aiserver.v1;
+
+import "agent/v1/agent.proto";
+
+import "aiserver/v1/utils.proto";
+
+import "google/protobuf/empty.proto";
+
+enum BackgroundComposerSource {
+  BACKGROUND_COMPOSER_SOURCE_UNSPECIFIED = 0;
+  BACKGROUND_COMPOSER_SOURCE_EDITOR = 1;
+  BACKGROUND_COMPOSER_SOURCE_SLACK = 2;
+  BACKGROUND_COMPOSER_SOURCE_WEBSITE = 3;
+  BACKGROUND_COMPOSER_SOURCE_LINEAR = 4;
+  BACKGROUND_COMPOSER_SOURCE_IOS_APP = 5;
+  BACKGROUND_COMPOSER_SOURCE_API = 6;
+  BACKGROUND_COMPOSER_SOURCE_GITHUB = 7;
+  BACKGROUND_COMPOSER_SOURCE_CLI = 8;
+  BACKGROUND_COMPOSER_SOURCE_GITHUB_CI_AUTOFIX = 9;
+  BACKGROUND_COMPOSER_SOURCE_GITLAB = 10;
+  BACKGROUND_COMPOSER_SOURCE_ENVIRONMENT_SETUP_WEB = 11;
+  BACKGROUND_COMPOSER_SOURCE_GRIND_WEB = 12;
+  BACKGROUND_COMPOSER_SOURCE_BUGBOT_AUTOFIX = 13;
+  BACKGROUND_COMPOSER_SOURCE_AUTOMATIONS = 14;
+  BACKGROUND_COMPOSER_SOURCE_GRAPHITE_CHAT_WEB = 15;
+  BACKGROUND_COMPOSER_SOURCE_GLASS = 16;
+  BACKGROUND_COMPOSER_SOURCE_GRAPHITE_FULL_SELF_DRIVING = 17;
+  BACKGROUND_COMPOSER_SOURCE_TEAMS = 18;
+  BACKGROUND_COMPOSER_SOURCE_LOCAL = 19;
+  BACKGROUND_COMPOSER_SOURCE_JIRA = 20;
+  BACKGROUND_COMPOSER_SOURCE_SDK = 21;
+  BACKGROUND_COMPOSER_SOURCE_FULL_SELF_DRIVING = 22;
+  BACKGROUND_COMPOSER_SOURCE_QABOT_FRONTEND = 23;
+  BACKGROUND_COMPOSER_SOURCE_AS_SUBAGENT_FROM_LOCAL = 24;
+  BACKGROUND_COMPOSER_SOURCE_ENVIRONMENT_SETUP_GLASS = 25;
+  BACKGROUND_COMPOSER_SOURCE_SAND_CODING_SUBAGENT = 26;
+  BACKGROUND_COMPOSER_SOURCE_BITBUCKET = 27;
+  BACKGROUND_COMPOSER_SOURCE_CLOUD_META_AGENT = 28;
+  BACKGROUND_COMPOSER_SOURCE_AS_SUBAGENT_FROM_CLOUD = 29;
+  BACKGROUND_COMPOSER_SOURCE_ENVIRONMENT_SETUP_ONBOARDING_AUTO = 30;
+  BACKGROUND_COMPOSER_SOURCE_ORIGIN = 31;
+}
+
+enum CloudAgentStartupWarningType {
+  CLOUD_AGENT_STARTUP_WARNING_TYPE_UNSPECIFIED = 0;
+  CLOUD_AGENT_STARTUP_WARNING_TYPE_SNAPSHOT_EXPIRED = 1;
+  CLOUD_AGENT_STARTUP_WARNING_TYPE_SNAPSHOT_INVALID = 2;
+  CLOUD_AGENT_STARTUP_WARNING_TYPE_SNAPSHOT_NOT_FOUND_OR_NO_ACCESS = 3;
+  CLOUD_AGENT_STARTUP_WARNING_TYPE_SNAPSHOT_COPY_FAILED = 4;
+}
+
+message PrivateWorkspaceIdentifier {
+  string id = 1;
+  string uri = 2;
+}
+
+message GrindModeConfig {
+  enum Phase {
+    PHASE_UNSPECIFIED = 0;
+    PHASE_PLANNING = 1;
+    PHASE_EXECUTING = 2;
+    PHASE_CONTROLLER = 3;
+  }
+  int64 time_budget_ms = 1;
+  optional int64 start_time_unix_ms = 2;
+  Phase phase = 3;
+  optional bool auto_proceed_after_planning = 4;
+  optional int64 time_budget_seconds = 5;
+  optional bool grind_prompt_calibrate_effort = 6;
+}
+
+message CloudAgentState {
+  agent.v1.ConversationStateStructure conversation_state = 1;
+  uint32 num_prior_interaction_updates = 2;
+  bytes pr_body = 3;
+  bytes summary = 4;
+  bytes branch_name = 5;
+  bytes pr_url = 6;
+  bytes agent_name = 8;
+  string last_interaction_update_offset_key = 7;
+  optional string starting_commit = 9;
+  optional string base_branch = 10;
+  bytes config = 11;
+  optional string local_state_branch = 12;
+  bytes original_prompt_blob_id = 13;
+  bytes repository_info_blob_id = 14;
+  bytes original_conversation_action_blob_id = 15;
+  bytes video_annotations_blob_id = 16;
+  optional string last_user_turn_commit = 17;
+  optional BackgroundComposerSource last_followup_source = 18;
+  optional bool continue_rebase = 19;
+  repeated string turn_start_todo_ids = 20;
+  optional int64 original_request_start_unix_ms = 21;
+  optional bool initial_turn_latency_reported = 22;
+  optional string agent_session_id = 23;
+  optional string kickoff_message_id = 24;
+  optional GrindModeConfig grind_mode_config = 25;
+  repeated BackgroundComposerCommit commits = 26;
+  optional int32 commit_count = 27;
+  optional CloudAgentErrorDetails user_facing_error_details = 28;
+  optional BackgroundComposerSource initial_source = 29;
+  uint32 num_completed_turns = 30;
+  optional SynthesisSubagentConfig synthesis_subagent_config = 31;
+  bytes start_request_blob_id = 32;
+  bytes commit_reminder_state_blob_id = 33;
+  bytes grind_mode_tracking_state_blob_id = 34;
+  bytes workflow_control_state_blob_id = 35;
+  repeated WorkerCreation worker_creations = 36;
+  optional bool is_time_limit_expired = 37;
+  bytes resolved_egress_policy_blob_id = 38;
+  optional OptimizedDiffState optimized_diff = 39;
+  bytes pending_pr_blob_id = 40;
+  optional bool is_pod_finalized = 41;
+  bytes next_turn_system_reminders_blob_id = 42;
+  bytes cloud_plugin_manifest_blob_id = 43;
+  map<string, OptimizedDiffState> per_branch_optimized_diffs = 44;
+  repeated CloudAgentStartupWarning startup_warnings = 45;
+  optional PrivateWorkspaceIdentifier private_workspace_identifier = 46;
+  optional bool uses_first_class_subagents = 48;
+  optional uint32 conversation_rewind_epoch = 49;
+  bytes pending_summarization_state_blob_id = 50;
+  bytes pending_summarization_snapshot_blob_id = 51;
+  bytes admitted_custom_mode_state_blob_id = 52;
+}
+
+message OptimizedDiffState {
+  optional string branch_name = 3;
+  optional string base_branch = 4;
+  optional string repo_url = 5;
+  oneof state {
+    google.protobuf.Empty pending = 1;
+    bytes diff_blob_id = 2;
+  }
+}
+
+message WorkerCreation {
+  uint32 worker_index = 1;
+  int64 created_at_unix_ms = 2;
+  uint32 num_completed_turns = 3;
+}
+
+message SynthesisSubagentConfig {
+  repeated string additional_model_names = 1;
+  bytes original_user_prompt_blob_id = 2;
+}
+
+message CloudAgentErrorDetails {
+  string error_message = 1;
+  string error_code = 2;
+  optional string dev_only_message = 3;
+  optional ErrorDetails error_details = 4;
+}
+
+message CloudAgentStartupWarning {
+  CloudAgentStartupWarningType warning_type = 1;
+  string user_facing_message = 2;
+}
+
+message BackgroundComposerCommit {
+  string sha = 1;
+  string message = 2;
+  string author_name = 3;
+  string author_email = 4;
+  string timestamp = 5;
+}

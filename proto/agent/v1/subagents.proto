@@ -1,0 +1,52 @@
+syntax = "proto3";
+
+package agent.v1;
+
+enum TaskMode {
+  TASK_MODE_UNSPECIFIED = 0;
+  TASK_MODE_AGENT = 1;
+  TASK_MODE_PLAN = 2;
+}
+
+message SubagentType {
+  oneof type {
+    SubagentTypeUnspecified unspecified = 1;
+    SubagentTypeComputerUse computer_use = 2;
+    SubagentTypeCustom custom = 3;
+    SubagentTypeExplore explore = 4;
+    SubagentTypeMediaReview media_review = 5;
+    SubagentTypeBash bash = 6;
+    SubagentTypeBrowserUse browser_use = 7;
+    SubagentTypeShell shell = 8;
+    SubagentTypeVmSetupHelper vm_setup_helper = 9;
+    SubagentTypeDebug debug = 10;
+    SubagentTypeCursorGuide cursor_guide = 11;
+    SubagentTypeWatchVideo watch_video = 12;
+  }
+}
+
+message SubagentTypeUnspecified {}
+
+message SubagentTypeComputerUse {}
+
+message SubagentTypeExplore {}
+
+message SubagentTypeMediaReview {}
+
+message SubagentTypeBash {}
+
+message SubagentTypeShell {}
+
+message SubagentTypeBrowserUse {}
+
+message SubagentTypeVmSetupHelper {}
+
+message SubagentTypeDebug {}
+
+message SubagentTypeCursorGuide {}
+
+message SubagentTypeWatchVideo {}
+
+message SubagentTypeCustom {
+  string name = 1;
+}

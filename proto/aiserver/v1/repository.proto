@@ -1,0 +1,10 @@
+syntax = "proto3";
+
+package aiserver.v1;
+
+import "aiserver/v1/utils.proto";
+
+message CodeResult {
+  CodeBlock code_block = 1;
+  float score = 2;
+}
