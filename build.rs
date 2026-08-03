@@ -4,13 +4,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root = "proto";
     println!("cargo:rerun-if-changed=proto");
 
-    // 统一正斜杠: Windows 上 walkdir 产出反斜杠路径,剥掉 include 前缀后
+    // 统一正斜杠: Windows 宿主上 walkdir 产出反斜杠路径,剥掉 include 前缀后
     // 与 descriptor set 里的正斜杠文件名对不上,codegen 会报 FileNotFound。
+    // 只在 Windows 宿主替换(build script 恒为宿主编译,cfg!(windows) 即宿主判定);
+    // 其它宿主的路径本就是正斜杠,交叉编译到 Windows 目标也不需要。
     let files: Vec<String> = walkdir::WalkDir::new(root)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.path().extension().is_some_and(|x| x == "proto"))
-        .map(|e| e.path().to_string_lossy().replace('\\', "/"))
+        .map(|e| {
+            let p = e.path().to_string_lossy();
+            if cfg!(windows) { p.replace('\\', "/") } else { p.into_owned() }
+        })
         .collect();
 
     // buffa-build 的全部全局开关在此显式固定,包括与当前默认值一致的项:
