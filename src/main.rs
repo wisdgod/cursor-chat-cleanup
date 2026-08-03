@@ -3,6 +3,7 @@ mod delete;
 mod error;
 mod gc;
 mod headers;
+mod lineage;
 mod maintenance;
 mod mark;
 mod progress;
@@ -200,11 +201,12 @@ fn sweep_cmd(path: &Path, apply: bool, no_backup: bool) -> Result<()> {
             db::with_analysis(path, |conn| {
                 let sessions = headers::load_union(conn)?;
                 let live = headers::live_set(&sessions)?;
-                sweep::plan(conn, &live, true, p)
+                let dangling = lineage::Lineage::build(&sessions).dangling_ids();
+                sweep::plan(conn, &live, dangling, true, p)
             })
         })?;
         print_plan(&plan);
-        if !plan.keys.is_empty() {
+        if !plan.keys.is_empty() || !plan.dangling_sessions.is_empty() {
             println!("\ndry-run 完成,没有删除任何数据。加 --apply 执行(需先完全退出 Cursor)。");
         }
         return Ok(());
@@ -213,7 +215,15 @@ fn sweep_cmd(path: &Path, apply: bool, no_backup: bool) -> Result<()> {
     println!("!! 执行期间请勿启动 Cursor(否则可能触发它的静默回滚机制) !!\n");
     let outcome = with_ticker(|p| sweep::apply(path, !no_backup, p))?;
     print_plan(&outcome.plan);
-    println!("\n已删除 {} 行。", outcome.deleted_rows);
+    println!(
+        "\n已删除 {} 行{}。",
+        outcome.deleted_rows,
+        if outcome.purged_header_rows > 0 {
+            format!(",连带清除 {} 个孤儿子代理 header", outcome.purged_header_rows)
+        } else {
+            String::new()
+        }
+    );
     if let Some(bk) = &outcome.backup_path {
         println!("删除前备份: {}", bk.display());
         println!("  如需回滚: cursor-chat-cleanup restore \"{}\"", bk.display());
@@ -247,7 +257,7 @@ fn delete_cmd(path: &Path, ids: &[String], apply: bool, no_backup: bool) -> Resu
         let plan = with_ticker(|p| {
             db::with_analysis(path, |conn| {
                 let sessions = headers::load_union(conn)?;
-                let targets = delete::resolve_targets(&sessions, ids)?;
+                let targets = delete::resolve_targets_cascading(&sessions, ids)?;
                 delete::plan(conn, targets, p)
             })
         })?;
@@ -279,10 +289,11 @@ fn delete_cmd(path: &Path, ids: &[String], apply: bool, no_backup: bool) -> Resu
 }
 
 fn print_delete_plan(plan: &delete::DeletePlan) {
-    println!("目标会话:");
+    println!("目标会话(删除会话必须连带其全部子代理):");
     for t in &plan.targets {
         println!(
-            "  {}  {}{}",
+            "  {}{}  {}{}",
+            if t.cascaded { "  └ 连带 " } else { "" },
             t.composer_id.short(),
             t.name.as_deref().unwrap_or("(未命名)"),
             match (t.in_header_table, t.in_legacy_blob) {
@@ -461,7 +472,7 @@ fn print_gc_plan(plan: &gc::GcPlan) {
 }
 
 fn print_plan(plan: &sweep::SweepPlan) {
-    if plan.keys.is_empty() {
+    if plan.keys.is_empty() && plan.dangling_sessions.is_empty() {
         println!("没有可清扫的孤儿数据。");
         return;
     }
@@ -483,6 +494,15 @@ fn print_plan(plan: &sweep::SweepPlan) {
     }
     for (prefix, stat) in &plan.per_prefix {
         println!("  {prefix:<36} {:>8} 行  {:>10}", stat.rows, ByteSize::b(stat.bytes).to_string());
+    }
+    if !plan.dangling_sessions.is_empty() {
+        println!(
+            "孤儿子代理(父会话已删除,将连 header 一起清除): {} 个",
+            plan.dangling_sessions.len()
+        );
+        for id in &plan.dangling_sessions {
+            println!("  {}", &id[..8.min(id.len())]);
+        }
     }
 }
 
@@ -551,6 +571,28 @@ fn report(path: &Path, deep: bool) -> Result<()> {
     println!("  ItemTable 旧 blob:      {in_blob}");
     println!("  并集(存活判定):         {}", sessions.len());
     println!("  仅在表里 / 仅在 blob 里: {table_only} / {blob_only}");
+
+    println!("\n== 父子归属 ==");
+    let lin = lineage::Lineage::build(&sessions);
+    let mut mains = 0u64;
+    let mut attached = 0u64;
+    let mut unattributable = 0u64;
+    for s in &sessions {
+        match lin.attach(&s.composer_id) {
+            lineage::Attach::Main => mains += 1,
+            lineage::Attach::Attached => attached += 1,
+            lineage::Attach::Unattributable => unattributable += 1,
+            lineage::Attach::Dangling => {}
+        }
+    }
+    let dangling = lin.dangling_ids();
+    println!("  主代理(用户手动 new):    {mains}");
+    println!("  挂靠子代理(随父删除):    {attached}");
+    println!("  无归属子代理(保守保留):  {unattributable}");
+    println!("  孤儿子代理(可清扫):      {}", dangling.len());
+    for id in &dangling {
+        println!("    {}", &id[..8.min(id.len())]);
+    }
 
     println!("\n== header/data 一致性 ==");
     let tombstones = sessions.iter().filter(|s| s.is_archived && s.name.is_none()).count();

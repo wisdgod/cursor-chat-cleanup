@@ -53,7 +53,7 @@ pub enum Error {
     TargetNotFound { arg: String },
     #[error("前缀 {arg} 匹配到多个会话: {}", candidates.join(", "))]
     AmbiguousPrefix { arg: String, candidates: Vec<String> },
-    #[error("拒绝删除全部会话(如确实需要,请分批并至少保留一个)")]
+    #[error("拒绝删除: 删除后将不剩任何主代理会话(如确实需要,请分批并至少保留一个主代理)")]
     RefuseWipeAll,
     #[error("headers 里出现非法 composerId: {raw:?}")]
     BadHeaderId { raw: String, source: crate::types::IdError },

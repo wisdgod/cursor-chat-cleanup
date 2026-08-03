@@ -10,11 +10,16 @@ use serde_json::Value;
 
 use crate::error::{Ctx as _, Error, Result};
 
-/// 存活集合(两套来源并集)。任何 id 解析失败都整体报错:
+/// 存活集合(两套来源并集,再排除孤儿子代理)。任何 id 解析失败都整体报错:
 /// 静默跳过会把该会话的全部行错误地判为孤儿,是不可接受的方向。
+///
+/// 孤儿子代理(父链断裂的真子代理,见 [`crate::lineage`])不算存活:
+/// 其数据行由此自然成为孤儿行,清扫/GC 全链路无需特判。
 pub fn live_set(sessions: &[SessionHeader]) -> Result<crate::types::LiveSet> {
+    let lineage = crate::lineage::Lineage::build(sessions);
     let ids = sessions
         .iter()
+        .filter(|s| !lineage.is_dangling(&s.composer_id))
         .map(|s| {
             crate::types::ComposerId::parse(&s.composer_id).map_err(|source| {
                 Error::BadHeaderId { raw: s.composer_id.clone(), source }
@@ -34,17 +39,21 @@ pub struct SessionHeader {
     pub recency: i64,
     pub is_archived: bool,
     pub is_subagent: bool,
+    /// Best-of-N 并行子会话(官方 isSubagent 判定明确排除它,单列)。
+    pub is_best_of_n: bool,
     pub workspace_id: Option<String>,
     /// header JSON `workspaceIdentifier.uri` 里的项目路径(优先 `external`,回落 `path`)。
     /// 多数会话由此直接得到人类可读的 workspace 归属,无需查 workspace.json。
     pub workspace_folder: Option<String>,
     pub parent_composer_id: Option<String>,
+    /// Best-of-N 父方持有的子会话 id 列表(`subComposerIds`)。
+    pub sub_composer_ids: Vec<String>,
     pub in_header_table: bool,
     pub in_legacy_blob: bool,
 }
 
 /// 从 header JSON 提取 `workspaceIdentifier.uri` 的项目路径。
-/// `external` 是完整 URI(如 `vscode-remote://wsl+debian/home/...`),
+/// `external` 是完整 URI(如 `vscode-remote://<host>/home/...`),
 /// 缺失时回落到 `path`(纯路径段)。
 fn workspace_folder_of(header: &Value) -> Option<String> {
     let uri = header.pointer("/workspaceIdentifier/uri")?;
@@ -52,6 +61,15 @@ fn workspace_folder_of(header: &Value) -> Option<String> {
         .and_then(Value::as_str)
         .or_else(|| uri.get("path").and_then(Value::as_str))
         .map(str::to_owned)
+}
+
+/// Best-of-N 父方的子会话 id 列表(缺失时为空)。
+fn sub_composer_ids_of(header: &Value) -> Vec<String> {
+    header
+        .get("subComposerIds")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+        .unwrap_or_default()
 }
 
 /// 读两套来源并按 `composerId` 归并。
@@ -127,6 +145,13 @@ fn load_header_table(conn: &Connection) -> Result<Vec<SessionHeader>> {
             .and_then(Value::as_str)
             .map(str::to_owned);
         let workspace_folder = json.as_ref().and_then(workspace_folder_of);
+        let is_best_of_n = json
+            .as_ref()
+            .and_then(|j| j.get("isBestOfNSubcomposer"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let sub_composer_ids =
+            json.as_ref().map(sub_composer_ids_of).unwrap_or_default();
         out.push(SessionHeader {
             recency: recency.or(last_updated_at).or(created_at).unwrap_or(0),
             composer_id,
@@ -135,9 +160,11 @@ fn load_header_table(conn: &Connection) -> Result<Vec<SessionHeader>> {
             last_updated_at,
             is_archived: is_archived.unwrap_or(0) != 0,
             is_subagent: is_subagent.unwrap_or(0) != 0,
+            is_best_of_n,
             workspace_id,
             workspace_folder,
             parent_composer_id,
+            sub_composer_ids,
             in_header_table: true,
             in_legacy_blob: false,
         });
@@ -207,12 +234,14 @@ fn load_legacy_blob(conn: &Connection) -> Result<Vec<SessionHeader>> {
             recency: last_updated_at.unwrap_or(created_at),
             is_archived: h.get("isArchived").and_then(Value::as_bool).unwrap_or(false),
             is_subagent,
+            is_best_of_n,
             workspace_id: h
                 .pointer("/workspaceIdentifier/id")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
             workspace_folder: workspace_folder_of(h),
             parent_composer_id,
+            sub_composer_ids: sub_composer_ids_of(h),
             in_header_table: false,
             in_legacy_blob: true,
         });

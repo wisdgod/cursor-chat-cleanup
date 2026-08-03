@@ -23,6 +23,8 @@ pub struct WorkspaceInfo {
 ///
 /// 优先级: 任一 header 自带的 `workspaceIdentifier.uri` →
 /// `workspaceStorage/<id>/workspace.json` → 特判文案 → id 短前缀。
+/// 末段重名的工作区(如两个不同目录下的 `proj`)会追加路径区分段,
+/// 保证 label 在结果集内彼此可辨。
 pub fn resolve(
     sessions: &[crate::headers::SessionHeader],
     db_path: &Path,
@@ -53,7 +55,72 @@ pub fn resolve(
             .unwrap_or_else(|| fallback(wid));
         map.insert(wid.clone(), info);
     }
+    disambiguate(&mut map);
     map
+}
+
+/// 重名消歧: 同名 label 的一组工作区,从各自路径末段向前逐段扩展,
+/// 直到组内彼此可辨(VS Code 同款做法),显示为 `末段 (区分段)`。
+/// 路径完全相同(或无路径)仍撞名时,退化为追加 workspaceId 短前缀。
+fn disambiguate(map: &mut FxHashMap<String, WorkspaceInfo>) {
+    // label → 该组的 wid 列表
+    let mut groups: FxHashMap<String, Vec<String>> = FxHashMap::default();
+    for (wid, info) in map.iter() {
+        groups.entry(info.label.clone()).or_default().push(wid.clone());
+    }
+    for (label, mut wids) in groups {
+        if wids.len() < 2 {
+            continue;
+        }
+        wids.sort(); // 迭代顺序与哈希无关,消歧结果可复现
+        // 每个成员的父路径段(不含末段本身,percent 解码后)。剥掉 `scheme://`,
+        // 但保留 authority(如远程主机段,它恰好能区分远程/本地同名项目);
+        // 无 folder 或只有末段的成员没有可用区分段,直接走 wid 兜底。
+        let parents: Vec<Vec<String>> = wids
+            .iter()
+            .map(|wid| {
+                let mut segs: Vec<String> = map[wid].folder.as_deref().map_or_else(
+                    Vec::new,
+                    |f| {
+                        let path = f.split_once("://").map_or(f, |(_, rest)| rest);
+                        path.split('/').filter(|s| !s.is_empty()).map(percent_decode).collect()
+                    },
+                );
+                segs.pop(); // 去掉末段(= label 本身)
+                segs
+            })
+            .collect();
+        let max_len = parents.iter().map(Vec::len).max().unwrap_or(0);
+        // 从父路径末段起取 k 段(不足 k 段的取全部,互为后缀时整条父路径即区分),
+        // 直到有父路径的成员两两不同。
+        let mut resolved = vec![None::<String>; wids.len()];
+        for k in 1..=max_len {
+            let candidates: Vec<Option<String>> = parents
+                .iter()
+                .map(|p| {
+                    (!p.is_empty()).then(|| p[p.len().saturating_sub(k)..].join("/"))
+                })
+                .collect();
+            let mut seen: FxHashMap<&str, usize> = FxHashMap::default();
+            for c in candidates.iter().flatten() {
+                *seen.entry(c.as_str()).or_default() += 1;
+            }
+            if candidates.iter().flatten().all(|c| seen[c.as_str()] == 1) {
+                resolved = candidates;
+                break;
+            }
+        }
+        for (i, wid) in wids.iter().enumerate() {
+            let new_label = match &resolved[i] {
+                Some(part) => format!("{label} ({part})"),
+                // 路径无法区分(相同/缺失): 用 wid 短前缀兜底
+                None => format!("{label} ({}…)", wid.chars().take(8).collect::<String>()),
+            };
+            if let Some(info) = map.get_mut(wid) {
+                info.label = new_label;
+            }
+        }
+    }
 }
 
 fn from_folder(folder: &str) -> WorkspaceInfo {
@@ -129,11 +196,61 @@ mod tests {
     #[test]
     fn label_takes_last_segment_decoded() {
         assert_eq!(
-            label_of("vscode-remote://wsl%2Bdebian/home/wisd/repos/cursor-chat-cleanup"),
-            "cursor-chat-cleanup"
+            label_of("vscode-remote://wsl%2Bdistro/home/user/repos/my-project"),
+            "my-project"
         );
         assert_eq!(label_of("file:///c%3A/My%20Project/"), "My Project");
         assert_eq!(label_of("plain"), "plain");
+    }
+
+    fn info(label: &str, folder: Option<&str>) -> WorkspaceInfo {
+        WorkspaceInfo { label: label.to_owned(), folder: folder.map(str::to_owned) }
+    }
+
+    #[test]
+    fn disambiguate_duplicate_labels_by_path() {
+        let mut map = FxHashMap::default();
+        map.insert("w1".to_owned(), info("proj", Some("file:///home/alice/proj")));
+        map.insert("w2".to_owned(), info("proj", Some("file:///home/bob/proj")));
+        map.insert("w3".to_owned(), info("other", Some("file:///home/alice/other")));
+        disambiguate(&mut map);
+        assert_eq!(map["w1"].label, "proj (alice)");
+        assert_eq!(map["w2"].label, "proj (bob)");
+        assert_eq!(map["w3"].label, "other", "非重名不动");
+    }
+
+    #[test]
+    fn disambiguate_expands_until_distinct() {
+        let mut map = FxHashMap::default();
+        map.insert("w1".to_owned(), info("proj", Some("file:///x/a/proj")));
+        map.insert("w2".to_owned(), info("proj", Some("file:///y/a/proj")));
+        disambiguate(&mut map);
+        assert_eq!(map["w1"].label, "proj (x/a)");
+        assert_eq!(map["w2"].label, "proj (y/a)");
+    }
+
+    #[test]
+    fn disambiguate_suffix_paths_use_full_parent() {
+        // 一条父路径是另一条的后缀: 短的取整条父路径即可区分
+        let mut map = FxHashMap::default();
+        map.insert("w1".to_owned(), info("proj", Some("file:///a/proj")));
+        map.insert("w2".to_owned(), info("proj", Some("file:///x/a/proj")));
+        disambiguate(&mut map);
+        assert_eq!(map["w1"].label, "proj (a)");
+        assert_eq!(map["w2"].label, "proj (x/a)");
+    }
+
+    #[test]
+    fn disambiguate_falls_back_to_wid_prefix() {
+        // 路径完全相同(或缺失): 只能用 wid 短前缀兜底
+        let mut map = FxHashMap::default();
+        map.insert("aaaa1111bbbb".to_owned(), info("proj", Some("file:///same/proj")));
+        map.insert("cccc2222dddd".to_owned(), info("proj", Some("file:///same/proj")));
+        map.insert("eeee3333ffff".to_owned(), info("proj", None));
+        disambiguate(&mut map);
+        assert_eq!(map["aaaa1111bbbb"].label, "proj (aaaa1111…)");
+        assert_eq!(map["cccc2222dddd"].label, "proj (cccc2222…)");
+        assert_eq!(map["eeee3333ffff"].label, "proj (eeee3333…)");
     }
 
     #[test]
@@ -160,7 +277,7 @@ mod tests {
         std::fs::create_dir_all(&ws_dir).unwrap();
         std::fs::write(
             ws_dir.join("workspace.json"),
-            r#"{"folder": "vscode-remote://wsl%2Bdebian/tmp/from-json"}"#,
+            r#"{"folder": "vscode-remote://wsl%2Bdistro/tmp/from-json"}"#,
         )
         .unwrap();
 
@@ -172,9 +289,11 @@ mod tests {
             recency: 0,
             is_archived: false,
             is_subagent: false,
+            is_best_of_n: false,
             workspace_id: Some(wid.to_owned()),
             workspace_folder: folder.map(str::to_owned),
             parent_composer_id: None,
+            sub_composer_ids: Vec::new(),
             in_header_table: true,
             in_legacy_blob: false,
         };
@@ -186,7 +305,7 @@ mod tests {
         let map = resolve(&sessions, &global);
         assert_eq!(map["hdr"].label, "proj");
         assert_eq!(map["abc123"].label, "from-json");
-        assert_eq!(map["abc123"].folder.as_deref(), Some("vscode-remote://wsl%2Bdebian/tmp/from-json"));
+        assert_eq!(map["abc123"].folder.as_deref(), Some("vscode-remote://wsl%2Bdistro/tmp/from-json"));
         assert_eq!(map["empty-window"].label, "(无工作区)");
 
         let _ = std::fs::remove_dir_all(&root);

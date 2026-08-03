@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OptionalExtension};
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::Value;
 
 use crate::error::{Error, Result};
@@ -39,6 +39,18 @@ pub struct Target {
     pub name: Option<String>,
     pub in_header_table: bool,
     pub in_legacy_blob: bool,
+    /// true = 非用户直接指定,由级联展开并入的后代子代理。
+    pub cascaded: bool,
+}
+
+fn target_of(s: &headers::SessionHeader, cascaded: bool) -> Result<Target> {
+    Ok(Target {
+        composer_id: crate::types::ComposerId::parse(&s.composer_id)?,
+        name: s.name.clone(),
+        in_header_table: s.in_header_table,
+        in_legacy_blob: s.in_legacy_blob,
+        cascaded,
+    })
 }
 
 /// 把用户输入(完整 id 或 >=6 位前缀)解析成唯一的 composerId。
@@ -59,12 +71,7 @@ pub fn resolve_targets(sessions: &[headers::SessionHeader], args: &[String]) -> 
             1 => {
                 let s = matches[0];
                 if seen.insert(s.composer_id.clone()) {
-                    out.push(Target {
-                        composer_id: crate::types::ComposerId::parse(&s.composer_id)?,
-                        name: s.name.clone(),
-                        in_header_table: s.in_header_table,
-                        in_legacy_blob: s.in_legacy_blob,
-                    });
+                    out.push(target_of(s, false)?);
                 }
             }
             _ => {
@@ -72,6 +79,40 @@ pub fn resolve_targets(sessions: &[headers::SessionHeader], args: &[String]) -> 
                     arg: arg.to_owned(),
                     candidates: matches.iter().map(|s| s.composer_id.clone()).collect(),
                 });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// 解析目标并级联展开: 删除会话**必须**连带其全部后代子代理
+/// (含子代理的子代理与 Best-of-N 子会话),否则留下无法归属的孤儿。
+pub fn resolve_targets_cascading(
+    sessions: &[headers::SessionHeader],
+    args: &[String],
+) -> Result<Vec<Target>> {
+    let targets = resolve_targets(sessions, args)?;
+    expand_with_descendants(sessions, targets)
+}
+
+/// 把每个目标的全部后代并入目标集(去重;并入者标记 `cascaded`)。
+pub fn expand_with_descendants(
+    sessions: &[headers::SessionHeader],
+    targets: Vec<Target>,
+) -> Result<Vec<Target>> {
+    let lineage = crate::lineage::Lineage::build(sessions);
+    let by_id: FxHashMap<&str, &headers::SessionHeader> =
+        sessions.iter().map(|s| (s.composer_id.as_str(), s)).collect();
+    let mut seen: FxHashSet<String> =
+        targets.iter().map(|t| t.composer_id.as_str().to_owned()).collect();
+    let explicit: Vec<String> = seen.iter().cloned().collect();
+    let mut out = targets;
+    for id in explicit {
+        for d in lineage.descendants_of(&id) {
+            if seen.insert(d.clone())
+                && let Some(s) = by_id.get(d.as_str())
+            {
+                out.push(target_of(s, true)?);
             }
         }
     }
@@ -234,11 +275,27 @@ pub fn apply_on(
     p: &crate::progress::Progress,
 ) -> Result<DeleteOutcome> {
     let sessions = headers::load_union(conn)?;
-    let targets = resolve_targets(&sessions, target_args)?;
+    let targets = resolve_targets_cascading(&sessions, target_args)?;
     if targets.is_empty() {
         return Err(Error::NoTargets);
     }
-    if targets.len() >= sessions.len() {
+    // 全灭守卫: 删除后必须至少剩一个主代理。级联会自动带上后代,
+    // 所以"仅有的主代理+其全部子代理"是合法删除,不能按总数误拒;
+    // 库里本就没有主代理的极端情形退回旧规则(不许删空)。
+    let target_ids: FxHashSet<&str> =
+        targets.iter().map(|t| t.composer_id.as_str()).collect();
+    let lineage = crate::lineage::Lineage::build(&sessions);
+    let main_ids: Vec<&str> = sessions
+        .iter()
+        .filter(|s| lineage.attach(&s.composer_id) == crate::lineage::Attach::Main)
+        .map(|s| s.composer_id.as_str())
+        .collect();
+    let refuse = if main_ids.is_empty() {
+        targets.len() >= sessions.len()
+    } else {
+        main_ids.iter().all(|id| target_ids.contains(id))
+    };
+    if refuse {
         return Err(Error::RefuseWipeAll);
     }
 
@@ -260,30 +317,8 @@ pub fn apply_on(
     // ---- 1. cursorDiskKV 行 ----
     let deleted_rows = sweep::delete_keys(conn, &plan.keys, p)?;
 
-    // ---- 2. composerHeaders 表 ----
-    let mut deleted_header_rows = 0u64;
-    for id in &ids {
-        deleted_header_rows +=
-            conn.execute("DELETE FROM composerHeaders WHERE composerId = ?1", [id])? as u64;
-    }
-
-    // ---- 3. global ItemTable 的两个 blob ----
-    let legacy_blob_edited = edit_item_table_json(conn, "composer.composerHeaders", &ids)?
-        | edit_item_table_json(conn, "composer.composerData", &ids)?;
-
-    // ---- 4. workspace 库 ----
-    p.stage("清理 workspace 库", 0);
-    let mut workspaces_edited = Vec::new();
-    for ws_db in workspace_dbs(db_path) {
-        match edit_workspace_db(&ws_db, &ids, backup_path.as_deref()) {
-            Ok(true) => workspaces_edited.push(ws_db),
-            Ok(false) => {}
-            // workspace 库损坏/被占不应中止主流程,记下来提醒用户即可
-            Err(e) => {
-                eprintln!("警告: workspace 库处理失败 {}: {}", ws_db.display(), e.render())
-            }
-        }
-    }
+    // ---- 2/3/4. header 痕迹(表 + 全局 blob + workspace 库) ----
+    let purge = purge_headers(conn, db_path, &ids, backup_path.as_deref(), p)?;
 
     if finalize {
         p.stage("checkpoint", 0);
@@ -296,15 +331,58 @@ pub fn apply_on(
     Ok(DeleteOutcome {
         plan,
         deleted_rows,
-        deleted_header_rows,
-        legacy_blob_edited,
-        workspaces_edited,
+        deleted_header_rows: purge.header_rows,
+        legacy_blob_edited: purge.legacy_blob_edited,
+        workspaces_edited: purge.workspaces_edited,
         backup_path,
     })
 }
 
+/// header 痕迹清理的结果(四处同步的第 2/3/4 步)。
+pub struct HeaderPurge {
+    pub header_rows: u64,
+    pub legacy_blob_edited: bool,
+    pub workspaces_edited: Vec<PathBuf>,
+}
+
+/// 删除一组会话的全部 header 痕迹: composerHeaders 表、全局 ItemTable
+/// 两个 JSON blob、每个 workspace 库的引用。cursorDiskKV 行不在此处理。
+///
+/// 调用方若要可回滚,须在调用前先把 header 快照写进 sidecar
+/// ([`snapshot_extras`]);workspace 库的 JSON 原文在此内部快照。
+pub fn purge_headers(
+    conn: &Connection,
+    db_path: &Path,
+    ids: &FxHashSet<String>,
+    backup: Option<&Path>,
+    p: &crate::progress::Progress,
+) -> Result<HeaderPurge> {
+    let mut header_rows = 0u64;
+    for id in ids {
+        header_rows +=
+            conn.execute("DELETE FROM composerHeaders WHERE composerId = ?1", [id])? as u64;
+    }
+
+    let legacy_blob_edited = edit_item_table_json(conn, "composer.composerHeaders", ids)?
+        | edit_item_table_json(conn, "composer.composerData", ids)?;
+
+    p.stage("清理 workspace 库", 0);
+    let mut workspaces_edited = Vec::new();
+    for ws_db in workspace_dbs(db_path) {
+        match edit_workspace_db(&ws_db, ids, backup) {
+            Ok(true) => workspaces_edited.push(ws_db),
+            Ok(false) => {}
+            // workspace 库损坏/被占不应中止主流程,记下来提醒用户即可
+            Err(e) => {
+                eprintln!("警告: workspace 库处理失败 {}: {}", ws_db.display(), e.render())
+            }
+        }
+    }
+    Ok(HeaderPurge { header_rows, legacy_blob_edited, workspaces_edited })
+}
+
 /// 向 sweep 生成的 sidecar 里追加 header 行与 ItemTable JSON 快照。
-fn snapshot_extras(conn: &Connection, db_path: &Path, ids: &FxHashSet<String>, backup: &Path) -> Result<()> {
+pub fn snapshot_extras(conn: &Connection, db_path: &Path, ids: &FxHashSet<String>, backup: &Path) -> Result<()> {
     let bk = Connection::open(backup)?;
     bk.execute_batch(
         "CREATE TABLE IF NOT EXISTS deleted_headers (
@@ -593,6 +671,115 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// 删除主代理必须连带全部后代(子代理的子代理也算);
+    /// 只删子代理则不动主代理,只带走它自己的后代。
+    #[test]
+    fn delete_cascades_to_descendants() {
+        let root = std::env::temp_dir().join(format!("ccc-del-cascade-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("User/globalStorage");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("state.vscdb");
+
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);
+            CREATE TABLE cursorDiskKV (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);
+            CREATE TABLE composerHeaders (
+              composerId TEXT PRIMARY KEY, workspaceId TEXT, createdAt INTEGER,
+              lastUpdatedAt INTEGER, isArchived INTEGER, isSubagent INTEGER,
+              recency INTEGER, checkpointAt INTEGER, value TEXT
+            );
+            INSERT INTO composerHeaders (composerId, createdAt, recency, isSubagent, value) VALUES
+              ('root-aaaaaa', 1000, 1000, 0, '{"composerId":"root-aaaaaa","name":"root"}'),
+              ('sub1-bbbbbb', 1001, 1001, 1,
+               '{"composerId":"sub1-bbbbbb","subagentInfo":{"parentComposerId":"root-aaaaaa"}}'),
+              ('sub2-cccccc', 1002, 1002, 1,
+               '{"composerId":"sub2-cccccc","subagentInfo":{"parentComposerId":"sub1-bbbbbb"}}'),
+              ('keep-dddddd', 2000, 2000, 0, '{"composerId":"keep-dddddd","name":"keep"}');
+            INSERT INTO cursorDiskKV VALUES ('composerData:root-aaaaaa', 'R');
+            INSERT INTO cursorDiskKV VALUES ('composerData:sub1-bbbbbb', 'S1');
+            INSERT INTO cursorDiskKV VALUES ('composerData:sub2-cccccc', 'S2');
+            INSERT INTO cursorDiskKV VALUES ('composerData:keep-dddddd', 'K');
+            "#,
+        )
+        .unwrap();
+        drop(conn);
+
+        let outcome =
+            apply(&db, &["root-aaaaaa".into()], false, &crate::progress::Progress::new())
+                .unwrap();
+        assert_eq!(outcome.plan.targets.len(), 3, "root + 两级子代理");
+        assert_eq!(
+            outcome.plan.targets.iter().filter(|t| t.cascaded).count(),
+            2,
+            "两个后代是连带目标"
+        );
+        assert_eq!(outcome.deleted_rows, 3);
+        assert_eq!(outcome.deleted_header_rows, 3);
+
+        let conn = Connection::open(&db).unwrap();
+        assert_eq!(kv_count(&conn, "composerData:%"), 1, "只剩 keep");
+        let left: i64 =
+            conn.query_row("SELECT COUNT(*) FROM composerHeaders", [], |r| r.get(0)).unwrap();
+        assert_eq!(left, 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 仅有的主代理+其全部子代理是合法删除吗?不——那会删空,应被守卫拒绝;
+    /// 但"主代理+子代理+另一个主代理"时删前者必须放行(旧守卫按总数会误拒)。
+    #[test]
+    fn wipe_guard_counts_main_agents_not_totals() {
+        let root = std::env::temp_dir().join(format!("ccc-del-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("User/globalStorage");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("state.vscdb");
+
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);
+            CREATE TABLE cursorDiskKV (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);
+            CREATE TABLE composerHeaders (
+              composerId TEXT PRIMARY KEY, workspaceId TEXT, createdAt INTEGER,
+              lastUpdatedAt INTEGER, isArchived INTEGER, isSubagent INTEGER,
+              recency INTEGER, checkpointAt INTEGER, value TEXT
+            );
+            INSERT INTO composerHeaders (composerId, createdAt, recency, isSubagent, value) VALUES
+              ('only-aaaaaa', 1000, 1000, 0, '{"composerId":"only-aaaaaa"}'),
+              ('subx-bbbbbb', 1001, 1001, 1,
+               '{"composerId":"subx-bbbbbb","subagentInfo":{"parentComposerId":"only-aaaaaa"}}');
+            INSERT INTO cursorDiskKV VALUES ('composerData:only-aaaaaa', 'A');
+            INSERT INTO cursorDiskKV VALUES ('composerData:subx-bbbbbb', 'B');
+            "#,
+        )
+        .unwrap();
+        drop(conn);
+
+        // 删除仅有的主代理(级联后 == 全部会话)→ 拒绝
+        let err = match apply(
+            &db,
+            &["only-aaaaaa".into()],
+            false,
+            &crate::progress::Progress::new(),
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("删空应被拒绝"),
+        };
+        assert!(matches!(err, Error::RefuseWipeAll), "实际错误: {}", err.render());
+
+        // 单删子代理: 主代理仍在,放行
+        let outcome =
+            apply(&db, &["subx-bbbbbb".into()], false, &crate::progress::Progress::new())
+                .unwrap();
+        assert_eq!(outcome.plan.targets.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn delete_refuses_wiping_all_sessions() {
         let (root, global, _ws) = setup("refuse");
@@ -611,36 +798,23 @@ mod tests {
 
     #[test]
     fn resolve_rejects_ambiguous_prefix() {
-        let sessions = vec![
-            headers::SessionHeader {
-                composer_id: "abcdef-1".into(),
-                name: None,
-                created_at: None,
-                last_updated_at: None,
-                recency: 0,
-                is_archived: false,
-                is_subagent: false,
-                workspace_id: None,
-                workspace_folder: None,
-                parent_composer_id: None,
-                in_header_table: true,
-                in_legacy_blob: false,
-            },
-            headers::SessionHeader {
-                composer_id: "abcdef-2".into(),
-                name: None,
-                created_at: None,
-                last_updated_at: None,
-                recency: 0,
-                is_archived: false,
-                is_subagent: false,
-                workspace_id: None,
-                workspace_folder: None,
-                parent_composer_id: None,
-                in_header_table: true,
-                in_legacy_blob: false,
-            },
-        ];
+        let mk = |id: &str| headers::SessionHeader {
+            composer_id: id.into(),
+            name: None,
+            created_at: None,
+            last_updated_at: None,
+            recency: 0,
+            is_archived: false,
+            is_subagent: false,
+            is_best_of_n: false,
+            workspace_id: None,
+            workspace_folder: None,
+            parent_composer_id: None,
+            sub_composer_ids: Vec::new(),
+            in_header_table: true,
+            in_legacy_blob: false,
+        };
+        let sessions = vec![mk("abcdef-1"), mk("abcdef-2")];
         assert!(resolve_targets(&sessions, &["abcdef".into()]).is_err());
         assert!(resolve_targets(&sessions, &["abcdef-1".into()]).is_ok());
     }

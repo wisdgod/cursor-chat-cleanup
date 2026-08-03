@@ -1,15 +1,18 @@
 //! 孤儿清扫。
 //!
-//! 只删两类行,都是 Cursor 界面上不可见的死数据:
-//! 1. 归属某个 composer、但该 composer 不在任何 header 来源里的行(孤儿);
+//! 删三类死数据,都是 Cursor 界面上不可见的:
+//! 1. 归属某个 composer、但该 composer 不算存活的行(孤儿行;孤儿子代理
+//!    因 [`crate::headers::live_set`] 排除,其数据行天然落入此类);
 //! 2. `composerData:` 下 value 为 NULL 的行(官方 set-NULL 删除 bug 留下的
-//!    墓碑;该 bug 是唯一的 NULL 写入点且只写此前缀,见逆向报告 6.3)。
+//!    墓碑;该 bug 是唯一的 NULL 写入点且只写此前缀,见逆向报告 6.3);
+//! 3. 孤儿子代理(父链断裂的真子代理)的 header 痕迹——与 delete 相同的
+//!    四处同步(composerHeaders 表、全局旧 blob、workspace 库)。
 //!
 //! `agentKv:blob:`(归属要 mark 才知道)、`composer.content.`(无 owner)、
 //! `agentKv:artifact:` 与迁移锁(硬约束)一律不碰。
 //!
-//! 删除前把受影响行原样导出到 sidecar SQLite(保留 TEXT/BLOB 类型),
-//! `restore` 子命令可整体回灌。
+//! 删除前把受影响行原样导出到 sidecar SQLite(保留 TEXT/BLOB 类型,
+//! header/ItemTable 快照与 delete 同格式),`restore` 子命令可整体回灌。
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -29,9 +32,14 @@ pub struct SweepPlan {
     pub tombstone_rows: u64,
     pub total_bytes: u64,
     pub orphan_composers: u64,
+    /// 孤儿子代理 id(父链断裂的真子代理): 数据行已按孤儿计入 `keys`,
+    /// 执行时还要连 header 一起四处同步删除。
+    pub dangling_sessions: Vec<String>,
 }
 
 /// 计算清扫计划。`conn` 可以是只读分析连接(dry-run)或写连接(apply)。
+/// `dangling` 是孤儿子代理 id 清单(来自 [`crate::lineage::Lineage`],
+/// 与 `live` 必须出自同一份 sessions,否则清单与孤儿判定会错位)。
 ///
 /// `with_bytes=false` 时走 covering index(不触任何数据页,3GB 库约 2 秒),
 /// `total_bytes`/per_prefix bytes 为 0——apply 内部重算计划时用。
@@ -40,6 +48,7 @@ pub struct SweepPlan {
 pub fn plan(
     conn: &Connection,
     live: &crate::types::LiveSet,
+    dangling: Vec<String>,
     with_bytes: bool,
     p: &crate::progress::Progress,
 ) -> Result<SweepPlan> {
@@ -112,12 +121,15 @@ pub fn plan(
         tombstone_rows,
         total_bytes,
         orphan_composers: orphans.len() as u64,
+        dangling_sessions: dangling,
     })
 }
 
 pub struct SweepOutcome {
     pub plan: SweepPlan,
     pub deleted_rows: u64,
+    /// 连带删除的孤儿子代理 header 行数。
+    pub purged_header_rows: u64,
     pub backup_path: Option<PathBuf>,
     pub page_size: i64,
     pub page_count_before: i64,
@@ -127,7 +139,7 @@ pub struct SweepOutcome {
 }
 
 /// 执行清扫。过安全门、在写连接上重算计划(不信任 dry-run 的旧快照)、
-/// 备份、分批删除、checkpoint、增量 vacuum。
+/// 备份、分批删除、孤儿子代理 header 四处同步、checkpoint、增量 vacuum。
 pub fn apply(
     db_path: &Path,
     make_backup: bool,
@@ -141,16 +153,18 @@ pub fn apply(
     if live.is_empty() {
         return Err(Error::EmptyLiveSet { action: "清扫" });
     }
+    let dangling = crate::lineage::Lineage::build(&sessions).dangling_ids();
 
     // apply 只需要 key,跳过值页读取
-    let plan = plan(&conn, &live, false, p)?;
+    let plan = plan(&conn, &live, dangling, false, p)?;
     let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
     let page_count_before: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
 
-    if plan.keys.is_empty() {
+    if plan.keys.is_empty() && plan.dangling_sessions.is_empty() {
         return Ok(SweepOutcome {
             plan,
             deleted_rows: 0,
+            purged_header_rows: 0,
             backup_path: None,
             page_size,
             page_count_before,
@@ -159,8 +173,14 @@ pub fn apply(
         });
     }
 
-    let (deleted_rows, backup_path) =
-        remove_keys(&mut conn, db_path, &plan.keys, "sweep", make_backup, p)?;
+    let (deleted_rows, purged_header_rows, backup_path) = apply_keys(
+        &mut conn,
+        db_path,
+        &plan.keys,
+        &plan.dangling_sessions,
+        make_backup,
+        p,
+    )?;
 
     p.stage("checkpoint", 0);
     safety::checkpoint_truncate(&conn)?;
@@ -172,6 +192,7 @@ pub fn apply(
     Ok(SweepOutcome {
         plan,
         deleted_rows,
+        purged_header_rows,
         backup_path,
         page_size,
         page_count_before,
@@ -180,18 +201,38 @@ pub fn apply(
     })
 }
 
-/// 按已知 key 清单清扫(维护模式专用)。
-///
-/// 清单来自持锁会话内的那次扫描: 排他锁保证库不被外部修改,
-/// 因此清单恒为精确,无需重扫。同样不做收尾。
+/// 按已知清单清扫: 备份(kv 行 + 孤儿子代理 header 快照)→ 删 kv 行 →
+/// 四处同步删孤儿子代理 header。维护模式直接用扫描时收集的清单调此函数
+/// (排他锁保证清单精确,零重扫);普通模式由 [`apply`] 重算后调用。
+/// **不做** checkpoint 与物理收缩,收尾由调用方负责。
 pub fn apply_keys(
     conn: &mut Connection,
     db_path: &Path,
     keys: &[String],
+    dangling: &[String],
     make_backup: bool,
     p: &crate::progress::Progress,
-) -> Result<(u64, Option<PathBuf>)> {
-    remove_keys(conn, db_path, keys, "sweep", make_backup, p)
+) -> Result<(u64, u64, Option<PathBuf>)> {
+    let dangling_set: FxHashSet<String> = dangling.iter().cloned().collect();
+    let backup_path = if make_backup {
+        let ts = jiff::Zoned::now().strftime("%Y%m%d-%H%M%S");
+        let path = PathBuf::from(format!("{}.sweep-backup-{ts}.sqlite", db_path.display()));
+        write_backup(conn, keys, &path, p)?;
+        if !dangling_set.is_empty() {
+            crate::delete::snapshot_extras(conn, db_path, &dangling_set, &path)?;
+        }
+        Some(path)
+    } else {
+        None
+    };
+    let deleted = delete_keys(conn, keys, p)?;
+    let purged_header_rows = if dangling_set.is_empty() {
+        0
+    } else {
+        crate::delete::purge_headers(conn, db_path, &dangling_set, backup_path.as_deref(), p)?
+            .header_rows
+    };
+    Ok((deleted, purged_header_rows, backup_path))
 }
 
 /// 备份(可选)+ 分批删除。**不做** checkpoint 与物理收缩:
@@ -483,7 +524,8 @@ mod tests {
 
         // 维护模式零重扫的正确性基石: 扫描收集的待删清单必须与
         // sweep::plan 独立算出的清单逐项一致
-        let plan_fast = plan(&conn, &live, false, &crate::progress::Progress::new()).unwrap();
+        let plan_fast =
+            plan(&conn, &live, Vec::new(), false, &crate::progress::Progress::new()).unwrap();
         let mut from_scan = scan.condemned_keys.clone();
         let mut from_plan = plan_fast.keys.clone();
         from_scan.sort();
@@ -506,13 +548,76 @@ mod tests {
         let fast_rows: Vec<_> = scan.per_prefix.iter().map(|(k, s)| (*k, s.rows)).collect();
         assert_eq!(deep_rows, fast_rows);
 
-        let plan_deep = plan(&conn, &live, true, &crate::progress::Progress::new()).unwrap();
+        let plan_deep =
+            plan(&conn, &live, Vec::new(), true, &crate::progress::Progress::new()).unwrap();
         let mut deep_keys = plan_deep.keys.clone();
         deep_keys.sort();
         assert_eq!(deep_keys, from_plan, "sweep::plan 两档 key 清单必须一致");
         assert_eq!(plan_deep.tombstone_rows, plan_fast.tombstone_rows);
 
         let _ = std::fs::remove_file(&db);
+    }
+
+    /// 孤儿子代理: 数据行按孤儿清扫,header 四处同步删除,restore 可整体回滚。
+    #[test]
+    fn sweep_purges_dangling_subagent_headers() {
+        let root = std::env::temp_dir()
+            .join(format!("ccc-sweep-dangling-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("User/globalStorage");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("state.vscdb");
+
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            r#"
+            PRAGMA auto_vacuum = INCREMENTAL;
+            CREATE TABLE ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);
+            CREATE TABLE cursorDiskKV (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);
+            CREATE TABLE composerHeaders (
+              composerId TEXT PRIMARY KEY, workspaceId TEXT, createdAt INTEGER,
+              lastUpdatedAt INTEGER, isArchived INTEGER, isSubagent INTEGER,
+              recency INTEGER, checkpointAt INTEGER, value TEXT
+            );
+
+            INSERT INTO composerHeaders (composerId, createdAt, recency, isSubagent, value)
+              VALUES ('main-1', 1000, 1000, 0, '{"composerId":"main-1","name":"keep"}'),
+                     ('dsub-1', 2000, 2000, 1,
+                      '{"composerId":"dsub-1","subagentInfo":{"parentComposerId":"gone-1"}}');
+            INSERT INTO ItemTable VALUES ('composer.composerHeaders',
+              '{"allComposers":[{"type":"head","composerId":"main-1","createdAt":1000}]}');
+
+            INSERT INTO cursorDiskKV VALUES ('composerData:main-1', 'KEEP');
+            INSERT INTO cursorDiskKV VALUES ('composerData:dsub-1', 'DANGLING');
+            INSERT INTO cursorDiskKV VALUES ('bubbleId:dsub-1:b1', x'aabb');
+            "#,
+        )
+        .unwrap();
+        drop(conn);
+
+        let outcome = apply(&db, true, &crate::progress::Progress::new()).unwrap();
+        assert_eq!(outcome.plan.dangling_sessions, vec!["dsub-1".to_string()]);
+        assert_eq!(outcome.deleted_rows, 2, "孤儿子代理的两行数据");
+        assert_eq!(outcome.purged_header_rows, 1);
+
+        let conn = Connection::open(&db).unwrap();
+        let headers_left: i64 =
+            conn.query_row("SELECT COUNT(*) FROM composerHeaders", [], |r| r.get(0)).unwrap();
+        assert_eq!(headers_left, 1, "只剩主代理 header");
+        assert_eq!(remaining_keys(&conn), vec!["composerData:main-1"]);
+        drop(conn);
+
+        // 回滚: kv 行与 header 一起还原
+        let bk = outcome.backup_path.unwrap();
+        let restored = restore(&db, &bk).unwrap();
+        assert_eq!(restored.kv_rows, 2);
+        assert_eq!(restored.header_rows, 1, "孤儿子代理 header 已还原");
+        let conn = Connection::open(&db).unwrap();
+        let headers_back: i64 =
+            conn.query_row("SELECT COUNT(*) FROM composerHeaders", [], |r| r.get(0)).unwrap();
+        assert_eq!(headers_back, 2);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
