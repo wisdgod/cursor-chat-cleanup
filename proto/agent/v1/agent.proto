@@ -19,6 +19,7 @@ import "agent/v1/fetch_tool.proto";
 import "agent/v1/generate_image_tool.proto";
 import "agent/v1/get_mcp_tools_tool.proto";
 import "agent/v1/glob_tool.proto";
+import "agent/v1/goal_tool.proto";
 import "agent/v1/grep_tool.proto";
 import "agent/v1/hook_additional_context.proto";
 import "agent/v1/ls_tool.proto";
@@ -141,6 +142,8 @@ enum SimulatedMsgReason {
   SIMULATED_MSG_REASON_SUBSCRIPTION = 28;
   SIMULATED_MSG_REASON_DIFF_TAB_CREATE_BRANCH = 29;
   SIMULATED_MSG_REASON_AGENT_STORE_CONFLICT = 30;
+  SIMULATED_MSG_REASON_GOAL_CONTINUATION = 31;
+  SIMULATED_MSG_REASON_PROJECT_KICKOFF = 32;
 }
 
 enum SubscriptionSource {
@@ -160,6 +163,37 @@ message TaskArgs {
   TaskMode mode = 8;
   repeated string responding_to_message_ids = 9;
   SubagentExecutionEnvironment environment = 10;
+  optional TargetMachine machine = 11;
+}
+
+message TargetMachine {
+  oneof machine {
+    SameMachineTarget same_machine = 1;
+    NewCloudVmTarget new_cloud_vm = 2;
+    SelfHostedWorkerTarget self_hosted_worker = 3;
+    SelfHostedPoolTarget self_hosted_pool = 4;
+  }
+}
+
+message SameMachineTarget {}
+
+message NewCloudVmTarget {
+  optional string environment_build_id = 1;
+  optional string base_branch = 2;
+}
+
+message SelfHostedWorkerTarget {
+  string worker_id = 1;
+}
+
+message SelfHostedPoolTarget {
+  optional string pool = 1;
+  repeated SelfHostedWorkerLabel labels = 2;
+}
+
+message SelfHostedWorkerLabel {
+  string key = 1;
+  string value = 2;
 }
 
 message TaskSuccess {
@@ -186,6 +220,7 @@ message TaskResult {
 message TaskToolCall {
   TaskArgs args = 1;
   TaskResult result = 2;
+  optional string cloud_agent_bc_id = 3;
 }
 
 message SetActiveBranchArgs {
@@ -275,6 +310,8 @@ message ToolCall {
     PiLsToolCall pi_ls_tool_call = 67;
     ConnectScmToolCall connect_scm_tool_call = 68;
     SearchConversationsToolCall search_conversations_tool_call = 69;
+    CreateGoalToolCall create_goal_tool_call = 70;
+    UpdateGoalToolCall update_goal_tool_call = 71;
   }
 }
 
@@ -365,7 +402,6 @@ message ProjectDetails {
 }
 
 message ProjectSubagentDetails {
-  string report_dir = 1;
   optional string store_dir = 2;
 }
 
@@ -416,6 +452,16 @@ message ThinkingMessage {
 message PlanRegistryEntry {
   string id = 1;
   string path = 2;
+}
+
+message GoalState {
+  string conversation_id = 1;
+  string goal_id = 2;
+  string objective = 3;
+  GoalStatus status = 4;
+  uint32 idle_continuations_without_tool_calls = 5;
+  optional uint64 active_duration_ms = 6;
+  optional uint64 last_accrued_at_ms = 7;
 }
 
 message ConversationTurnStructure {
@@ -565,4 +611,5 @@ message ConversationStateStructure {
   optional uint64 conversation_started_timestamp_ms = 26;
   optional string conversation_started_time_zone = 27;
   map<string, bytes> subagent_state_refs = 31;
+  optional GoalState goal_state = 32;
 }

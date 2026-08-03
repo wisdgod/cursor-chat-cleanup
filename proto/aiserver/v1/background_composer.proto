@@ -123,6 +123,7 @@ message CloudAgentState {
   bytes pending_summarization_state_blob_id = 50;
   bytes pending_summarization_snapshot_blob_id = 51;
   bytes admitted_custom_mode_state_blob_id = 52;
+  optional bool agent_store_artifacts_symlink_enabled = 53;
 }
 
 message OptimizedDiffState {
