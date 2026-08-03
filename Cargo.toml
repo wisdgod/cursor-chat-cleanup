@@ -1,6 +1,6 @@
 [package]
 name = "cursor-chat-cleanup"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["wisdgod <nav@wisdgod.com>"]
 license = "MIT OR Apache-2.0"
@@ -8,7 +8,6 @@ description = "TUI tool to analyze and clean up Cursor's local chat storage"
 repository = "https://github.com/wisdgod/cursor-chat-cleanup"
 
 [dependencies]
-anyhow = "1"
 base64 = "0.23"
 buffa = "0.9"
 buffa-types = "0.9"

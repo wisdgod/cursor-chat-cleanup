@@ -13,9 +13,9 @@
 
 use std::path::Path;
 
-use anyhow::{Context, Result};
 use rusqlite::Connection;
 
+use crate::error::{Ctx as _, Result};
 use crate::progress::Progress;
 use crate::safety;
 
@@ -165,7 +165,7 @@ pub fn vacuum_full(conn: &Connection, p: &Progress) -> Result<u64> {
     let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
     let before: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
     p.stage("全量 VACUUM(顺序重建,不可取消)", 0);
-    conn.execute_batch("VACUUM").context("VACUUM 失败")?;
+    conn.execute_batch("VACUUM").ctx("VACUUM 失败")?;
     let after: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
     Ok(((before - after).max(0) * page_size.max(0)) as u64)
 }

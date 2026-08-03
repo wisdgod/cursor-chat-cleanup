@@ -7,8 +7,9 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OpenFlags};
+
+use crate::error::{Error, Result};
 
 /// 定位 `state.vscdb`。
 ///
@@ -20,13 +21,10 @@ use rusqlite::{Connection, OpenFlags};
 /// 不可靠且极慢,该场景应在 Windows 侧运行本工具。坚持要跨,
 /// 用 `--db` 显式指定并自担风险。
 pub fn locate_db() -> Result<PathBuf> {
-    if let Some(p) = dirs::config_dir()
+    dirs::config_dir()
         .map(|d| d.join("Cursor/User/globalStorage/state.vscdb"))
         .filter(|p| p.exists())
-    {
-        return Ok(p);
-    }
-    bail!("未找到 Cursor 数据库,请用 --db 指定 state.vscdb 路径");
+        .ok_or(Error::DbNotFound)
 }
 
 /// 在一个只读分析连接上执行 `f`,遇到 immutable 快照失效导致的
@@ -38,20 +36,22 @@ pub fn with_analysis<T>(path: &Path, mut f: impl FnMut(&Connection) -> Result<T>
         attempt += 1;
         let conn = open_analysis(path)?;
         match f(&conn) {
-            Err(e) if attempt < MAX_ATTEMPTS && is_snapshot_torn(&e) => continue,
+            Err(e) if attempt < MAX_ATTEMPTS && e.is_snapshot_torn() => continue,
             r => return r,
         }
     }
 }
 
 fn open_analysis(path: &Path) -> Result<Connection> {
-    ensure!(path.exists(), "数据库不存在: {}", path.display());
+    if !path.exists() {
+        return Err(Error::DbMissing { path: path.to_owned() });
+    }
     let uri = format!("file:{}?immutable=1", uri_escape(path));
     Connection::open_with_flags(
         &uri,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
     )
-    .with_context(|| format!("打开数据库失败: {}", path.display()))
+    .map_err(|source| Error::OpenDb { path: path.to_owned(), source })
 }
 
 /// SQLite URI 文件名中 `%`、`?`、`#` 需要百分号转义。
@@ -96,15 +96,6 @@ impl Drop for CancelGuard<'_> {
     fn drop(&mut self) {
         let _ = self.conn.progress_handler(0, None::<fn() -> bool>);
     }
-}
-
-fn is_snapshot_torn(e: &anyhow::Error) -> bool {
-    e.chain().any(|cause| {
-        cause
-            .downcast_ref::<rusqlite::Error>()
-            .and_then(|re| re.sqlite_error_code())
-            .is_some_and(|code| code == rusqlite::ErrorCode::DatabaseCorrupt)
-    })
 }
 
 #[cfg(test)]
@@ -159,9 +150,6 @@ mod tests {
         let p = crate::progress::Progress::new();
         p.cancel();
         let err = crate::scan::scan_keys(&conn, &live, false, false, &p).unwrap_err();
-        assert!(
-            err.chain().any(|c| c.downcast_ref::<crate::progress::Cancelled>().is_some()),
-            "应以 Cancelled 退出,实际: {err:#}"
-        );
+        assert!(err.is_cancelled(), "应以 Cancelled 退出,实际: {}", err.render());
     }
 }

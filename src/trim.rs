@@ -11,11 +11,11 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, ensure};
 use rusqlite::Connection;
 use rustc_hash::FxHashSet;
 
 use crate::delete::{Target, resolve_targets};
+use crate::error::{Error, Result};
 use crate::scan::PrefixStat;
 use crate::{headers, safety, sweep};
 
@@ -81,7 +81,9 @@ pub fn apply_on(
 ) -> Result<TrimOutcome> {
     let sessions = headers::load_union(conn)?;
     let targets = resolve_targets(&sessions, target_args)?;
-    ensure!(!targets.is_empty(), "没有要修剪的会话");
+    if targets.is_empty() {
+        return Err(Error::NoTargets);
+    }
 
     let plan = plan(conn, targets, ui_only, p)?;
     let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;

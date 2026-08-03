@@ -1,5 +1,6 @@
 mod db;
 mod delete;
+mod error;
 mod gc;
 mod headers;
 mod maintenance;
@@ -13,12 +14,14 @@ mod trim;
 mod tui;
 mod types;
 mod vacuum;
+mod workspace;
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
 use bytesize::ByteSize;
 use clap::{Parser, Subcommand};
+
+use crate::error::{Error, Result};
 
 /// 分析与清理 Cursor 本地聊天存储的工具。不带子命令时进入 TUI。
 #[derive(Parser)]
@@ -108,7 +111,17 @@ enum Cmd {
     },
 }
 
-fn main() -> Result<()> {
+fn main() -> std::process::ExitCode {
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("错误: {}", e.render());
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<()> {
     let cli = Cli::parse();
     let path = match cli.db {
         Some(p) => p,
@@ -225,7 +238,9 @@ fn sweep_cmd(path: &Path, apply: bool, no_backup: bool) -> Result<()> {
 }
 
 fn delete_cmd(path: &Path, ids: &[String], apply: bool, no_backup: bool) -> Result<()> {
-    anyhow::ensure!(!ids.is_empty(), "请指定要删除的会话 id(report/TUI 里可以查到)");
+    if ids.is_empty() {
+        return Err(Error::NoTargets);
+    }
     println!("数据库: {}", path.display());
 
     if !apply {
@@ -289,7 +304,9 @@ fn print_delete_plan(plan: &delete::DeletePlan) {
 }
 
 fn trim_cmd(path: &Path, ids: &[String], ui_only: bool, apply: bool, no_backup: bool) -> Result<()> {
-    anyhow::ensure!(!ids.is_empty(), "请指定要修剪的会话 id(report/TUI 里可以查到)");
+    if ids.is_empty() {
+        return Err(Error::NoTargets);
+    }
     println!("数据库: {}", path.display());
 
     if !apply {
@@ -485,7 +502,7 @@ fn backup_cmd(path: &Path, delete: bool, delete_corrupted: bool) -> Result<()> {
             }
             if delete {
                 std::fs::remove_file(&bk.path)
-                    .with_context(|| format!("删除失败: {}", bk.path.display()))?;
+                    .map_err(|source| Error::RemoveFile { path: bk.path.clone(), source })?;
                 println!("  已删除,释放 {}。", ByteSize::b(bk.size));
             } else {
                 println!("  (加 --delete 删除)");
@@ -501,7 +518,8 @@ fn backup_cmd(path: &Path, delete: bool, delete_corrupted: bool) -> Result<()> {
         for (p, size) in &residue {
             println!("  {} ({})", p.display(), ByteSize::b(*size));
             if delete_corrupted {
-                std::fs::remove_file(p).with_context(|| format!("删除失败: {}", p.display()))?;
+                std::fs::remove_file(p)
+                    .map_err(|source| Error::RemoveFile { path: p.clone(), source })?;
                 println!("    已删除。");
             }
         }
@@ -589,6 +607,33 @@ fn report(path: &Path, deep: bool) -> Result<()> {
                 name,
                 &cid[..8.min(cid.len())],
             );
+        }
+    }
+
+    println!("\n== 按工作区 ==");
+    let ws_info = workspace::resolve(&sessions, path);
+    // wid("" = 无归属) → (会话数, 字节数)
+    let mut ws_agg: rustc_hash::FxHashMap<&str, (u64, u64)> = rustc_hash::FxHashMap::default();
+    for s in &sessions {
+        let wid = s.workspace_id.as_deref().unwrap_or("");
+        let bytes = scan.per_composer.get(&s.composer_id).map_or(0, |c| c.bytes);
+        let e = ws_agg.entry(wid).or_default();
+        e.0 += 1;
+        e.1 += bytes;
+    }
+    let mut ws_rows: Vec<_> = ws_agg.into_iter().collect();
+    // deep 模式按体积降序,否则按会话数降序
+    ws_rows.sort_by_key(|(_, (n, bytes))| std::cmp::Reverse(if deep { *bytes } else { *n }));
+    for (wid, (n, bytes)) in &ws_rows {
+        let label = if wid.is_empty() {
+            "(无归属)".to_owned()
+        } else {
+            ws_info.get(*wid).map_or_else(|| (*wid).to_owned(), |i| i.label.clone())
+        };
+        if deep {
+            println!("  {:>4} 会话  {:>10}  {label}", n, ByteSize::b(*bytes).to_string());
+        } else {
+            println!("  {n:>4} 会话  {label}");
         }
     }
 

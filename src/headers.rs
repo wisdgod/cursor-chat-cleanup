@@ -4,10 +4,11 @@
 //! `ItemTable['composer.composerHeaders']` blob(旧),两边都可能比另一边新,
 //! 必须取并集,否则会把只存在于另一套里的会话误判为孤儿。
 
-use anyhow::{Context, Result};
 use rusqlite::Connection;
 use rustc_hash::FxHashMap;
 use serde_json::Value;
+
+use crate::error::{Ctx as _, Error, Result};
 
 /// 存活集合(两套来源并集)。任何 id 解析失败都整体报错:
 /// 静默跳过会把该会话的全部行错误地判为孤儿,是不可接受的方向。
@@ -15,8 +16,9 @@ pub fn live_set(sessions: &[SessionHeader]) -> Result<crate::types::LiveSet> {
     let ids = sessions
         .iter()
         .map(|s| {
-            crate::types::ComposerId::parse(&s.composer_id)
-                .with_context(|| format!("headers 里出现非法 composerId: {:?}", s.composer_id))
+            crate::types::ComposerId::parse(&s.composer_id).map_err(|source| {
+                Error::BadHeaderId { raw: s.composer_id.clone(), source }
+            })
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(crate::types::LiveSet::from_ids(ids))
@@ -33,9 +35,23 @@ pub struct SessionHeader {
     pub is_archived: bool,
     pub is_subagent: bool,
     pub workspace_id: Option<String>,
+    /// header JSON `workspaceIdentifier.uri` 里的项目路径(优先 `external`,回落 `path`)。
+    /// 多数会话由此直接得到人类可读的 workspace 归属,无需查 workspace.json。
+    pub workspace_folder: Option<String>,
     pub parent_composer_id: Option<String>,
     pub in_header_table: bool,
     pub in_legacy_blob: bool,
+}
+
+/// 从 header JSON 提取 `workspaceIdentifier.uri` 的项目路径。
+/// `external` 是完整 URI(如 `vscode-remote://wsl+debian/home/...`),
+/// 缺失时回落到 `path`(纯路径段)。
+fn workspace_folder_of(header: &Value) -> Option<String> {
+    let uri = header.pointer("/workspaceIdentifier/uri")?;
+    uri.get("external")
+        .and_then(Value::as_str)
+        .or_else(|| uri.get("path").and_then(Value::as_str))
+        .map(str::to_owned)
 }
 
 /// 读两套来源并按 `composerId` 归并。
@@ -64,7 +80,7 @@ fn load_header_table(conn: &Connection) -> Result<Vec<SessionHeader>> {
             [],
             |r| r.get(0),
         )
-        .context("检查 composerHeaders 表失败")?;
+        .ctx("检查 composerHeaders 表失败")?;
     if !table_exists {
         return Ok(Vec::new());
     }
@@ -98,7 +114,7 @@ fn load_header_table(conn: &Connection) -> Result<Vec<SessionHeader>> {
     let mut out = Vec::new();
     for row in rows {
         let (composer_id, workspace_id, created_at, last_updated_at, is_archived, is_subagent, recency, value) =
-            row.context("读 composerHeaders 行失败")?;
+            row.ctx("读 composerHeaders 行失败")?;
         let json: Option<Value> = value.and_then(|v| serde_json::from_str(&v).ok());
         let name = json
             .as_ref()
@@ -110,6 +126,7 @@ fn load_header_table(conn: &Connection) -> Result<Vec<SessionHeader>> {
             .and_then(|j| j.pointer("/subagentInfo/parentComposerId"))
             .and_then(Value::as_str)
             .map(str::to_owned);
+        let workspace_folder = json.as_ref().and_then(workspace_folder_of);
         out.push(SessionHeader {
             recency: recency.or(last_updated_at).or(created_at).unwrap_or(0),
             composer_id,
@@ -119,6 +136,7 @@ fn load_header_table(conn: &Connection) -> Result<Vec<SessionHeader>> {
             is_archived: is_archived.unwrap_or(0) != 0,
             is_subagent: is_subagent.unwrap_or(0) != 0,
             workspace_id,
+            workspace_folder,
             parent_composer_id,
             in_header_table: true,
             in_legacy_blob: false,
@@ -151,7 +169,8 @@ fn load_legacy_blob(conn: &Connection) -> Result<Vec<SessionHeader>> {
         return Ok(Vec::new());
     };
 
-    let json: Value = serde_json::from_str(&raw).context("解析旧 header blob JSON 失败")?;
+    let json: Value = serde_json::from_str(&raw)
+        .map_err(|source| Error::Json { what: "旧 header blob", source })?;
     let Some(all) = json.get("allComposers").and_then(Value::as_array) else {
         return Ok(Vec::new());
     };
@@ -192,6 +211,7 @@ fn load_legacy_blob(conn: &Connection) -> Result<Vec<SessionHeader>> {
                 .pointer("/workspaceIdentifier/id")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
+            workspace_folder: workspace_folder_of(h),
             parent_composer_id,
             in_header_table: false,
             in_legacy_blob: true,

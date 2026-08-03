@@ -15,12 +15,12 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail, ensure};
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OptionalExtension};
 use rustc_hash::FxHashSet;
 use serde_json::Value;
 
+use crate::error::{Error, Result};
 use crate::scan::{Attribution, PrefixStat, attribute};
 use crate::{headers, safety, sweep};
 
@@ -55,7 +55,7 @@ pub fn resolve_targets(sessions: &[headers::SessionHeader], args: &[String]) -> 
             .filter(|s| s.composer_id == *arg || s.composer_id.starts_with(arg))
             .collect();
         match matches.len() {
-            0 => bail!("找不到会话: {arg}(先用 report/TUI 确认 id;孤儿数据请用 sweep)"),
+            0 => return Err(Error::TargetNotFound { arg: arg.to_owned() }),
             1 => {
                 let s = matches[0];
                 if seen.insert(s.composer_id.clone()) {
@@ -67,10 +67,12 @@ pub fn resolve_targets(sessions: &[headers::SessionHeader], args: &[String]) -> 
                     });
                 }
             }
-            _ => bail!(
-                "前缀 {arg} 匹配到多个会话: {}",
-                matches.iter().map(|s| s.composer_id.as_str()).collect::<Vec<_>>().join(", ")
-            ),
+            _ => {
+                return Err(Error::AmbiguousPrefix {
+                    arg: arg.to_owned(),
+                    candidates: matches.iter().map(|s| s.composer_id.clone()).collect(),
+                });
+            }
         }
     }
     Ok(out)
@@ -233,11 +235,12 @@ pub fn apply_on(
 ) -> Result<DeleteOutcome> {
     let sessions = headers::load_union(conn)?;
     let targets = resolve_targets(&sessions, target_args)?;
-    ensure!(!targets.is_empty(), "没有要删除的会话");
-    ensure!(
-        targets.len() < sessions.len(),
-        "拒绝删除全部会话(如确实需要,请分批并至少保留一个)"
-    );
+    if targets.is_empty() {
+        return Err(Error::NoTargets);
+    }
+    if targets.len() >= sessions.len() {
+        return Err(Error::RefuseWipeAll);
+    }
 
     let plan = plan(conn, targets, p)?;
     let ids: FxHashSet<String> =
@@ -276,7 +279,9 @@ pub fn apply_on(
             Ok(true) => workspaces_edited.push(ws_db),
             Ok(false) => {}
             // workspace 库损坏/被占不应中止主流程,记下来提醒用户即可
-            Err(e) => eprintln!("警告: workspace 库处理失败 {}: {e:#}", ws_db.display()),
+            Err(e) => {
+                eprintln!("警告: workspace 库处理失败 {}: {}", ws_db.display(), e.render())
+            }
         }
     }
 
@@ -367,9 +372,15 @@ fn edit_item_table_json(conn: &Connection, key: &str, ids: &FxHashSet<String>) -
     conn.execute(
         "INSERT INTO ItemTable (key, value) VALUES (?1, ?2)
          ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-        rusqlite::params![key, serde_json::to_string(&json)?],
+        rusqlite::params![key, to_json_string(&json)?],
     )?;
     Ok(true)
+}
+
+/// 序列化清洗后的 ItemTable JSON(输入来自 `serde_json::Value`,
+/// 失败只可能是极端情形,但仍按契约传播而非 unwrap)。
+fn to_json_string(v: &Value) -> Result<String> {
+    serde_json::to_string(v).map_err(|source| Error::Json { what: "序列化 ItemTable", source })
 }
 
 /// 就地清洗 JSON。返回是否有改动。
@@ -417,7 +428,7 @@ fn workspace_dbs(global_db: &Path) -> Vec<PathBuf> {
 /// 清洗一个 workspace 库。返回是否有改动。改动前把原 JSON 快照进 sidecar。
 fn edit_workspace_db(ws_db: &Path, ids: &FxHashSet<String>, backup: Option<&Path>) -> Result<bool> {
     let conn = Connection::open(ws_db)
-        .with_context(|| format!("打开 workspace 库失败: {}", ws_db.display()))?;
+        .map_err(|source| Error::OpenWorkspaceDb { path: ws_db.to_owned(), source })?;
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
 
     // 有的 workspace 库连 ItemTable 都没有
@@ -448,7 +459,7 @@ fn edit_workspace_db(ws_db: &Path, ids: &FxHashSet<String>, backup: Option<&Path
     conn.execute(
         "INSERT INTO ItemTable (key, value) VALUES (?1, ?2)
          ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-        rusqlite::params![key, serde_json::to_string(&json)?],
+        rusqlite::params![key, to_json_string(&json)?],
     )?;
     safety::checkpoint_truncate(&conn)?;
     Ok(true)
@@ -591,10 +602,10 @@ mod tests {
             false,
             &crate::progress::Progress::new(),
         ) {
-            Err(e) => e.to_string(),
+            Err(e) => e,
             Ok(_) => panic!("删除全部会话应当被拒绝"),
         };
-        assert!(err.contains("拒绝删除全部会话"), "实际错误: {err}");
+        assert!(matches!(err, Error::RefuseWipeAll), "实际错误: {}", err.render());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -610,6 +621,7 @@ mod tests {
                 is_archived: false,
                 is_subagent: false,
                 workspace_id: None,
+                workspace_folder: None,
                 parent_composer_id: None,
                 in_header_table: true,
                 in_legacy_blob: false,
@@ -623,6 +635,7 @@ mod tests {
                 is_archived: false,
                 is_subagent: false,
                 workspace_id: None,
+                workspace_folder: None,
                 parent_composer_id: None,
                 in_header_table: true,
                 in_legacy_blob: false,

@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use crate::error::Result;
 use bytesize::ByteSize;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -33,6 +33,10 @@ struct Entry {
     live: bool,
     rows: u64,
     bytes: Option<u64>,
+    /// header 里的 workspaceId。孤儿数据没有 header,不可归属,恒为 None。
+    workspace_id: Option<String>,
+    /// 解析后的工作区短标签(列表列与过滤用)。
+    ws_label: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -41,6 +45,7 @@ enum SortKey {
     Rows,
     Recency,
     Name,
+    Workspace,
 }
 
 impl SortKey {
@@ -49,7 +54,8 @@ impl SortKey {
             SortKey::Bytes => SortKey::Rows,
             SortKey::Rows => SortKey::Recency,
             SortKey::Recency => SortKey::Name,
-            SortKey::Name => SortKey::Bytes,
+            SortKey::Name => SortKey::Workspace,
+            SortKey::Workspace => SortKey::Bytes,
         }
     }
     fn label(self) -> &'static str {
@@ -58,6 +64,7 @@ impl SortKey {
             SortKey::Rows => "行数",
             SortKey::Recency => "时间",
             SortKey::Name => "名称",
+            SortKey::Workspace => "工作区",
         }
     }
 }
@@ -199,6 +206,21 @@ enum InfoLayer {
     Help,
 }
 
+/// 工作区选择层的一行。
+struct WsRow {
+    /// None = 全部(清除过滤);Some("") = 无归属;Some(id) = 具体工作区。
+    id: Option<String>,
+    label: String,
+    sessions: u64,
+    bytes: Option<u64>,
+}
+
+/// 工作区选择层(w 键)。TableState 让 ratatui 自动处理滚动。
+struct WsPicker {
+    rows: Vec<WsRow>,
+    table: TableState,
+}
+
 /// 后台全量扫描状态。
 enum ScanState {
     Running { started: Instant },
@@ -217,6 +239,11 @@ struct App {
     reverse: bool,
     view: View,
     filter: String,
+    /// 工作区过滤: None = 不过滤;Some("") = 只看无归属;Some(id) = 只看该工作区。
+    ws_filter: Option<String>,
+    /// workspaceId → 标签/路径(由 headers 解析,会话列表刷新时重算)。
+    workspaces: rustc_hash::FxHashMap<String, crate::workspace::WorkspaceInfo>,
+    ws_picker: Option<WsPicker>,
     input: InputMode,
     table: TableState,
     selected_ids: FxHashSet<String>,
@@ -250,6 +277,9 @@ pub fn run(path: PathBuf) -> Result<()> {
         reverse: false,
         view: View::All,
         filter: String::new(),
+        ws_filter: None,
+        workspaces: rustc_hash::FxHashMap::default(),
+        ws_picker: None,
         input: InputMode::Normal,
         table: TableState::default().with_selected(0),
         selected_ids: FxHashSet::default(),
@@ -264,6 +294,7 @@ pub fn run(path: PathBuf) -> Result<()> {
         tx,
         rx,
     };
+    app.refresh_workspaces();
     app.rebuild_entries();
     app.spawn_deep_scan();
 
@@ -278,7 +309,7 @@ pub fn run(path: PathBuf) -> Result<()> {
         match maint.release(&app.act_progress) {
             Ok(freed) if freed > 0 => eprintln!("完成,物理收缩 {}。", fmt_bytes(freed)),
             Ok(_) => eprintln!("完成。"),
-            Err(e) => eprintln!("警告: 维护模式收尾失败: {e:#}"),
+            Err(e) => eprintln!("警告: 维护模式收尾失败: {}", e.render()),
         }
     }
     result
@@ -287,6 +318,12 @@ pub fn run(path: PathBuf) -> Result<()> {
 impl App {
     fn scan_ready(&self) -> bool {
         matches!(self.scan_state, ScanState::Ready)
+    }
+
+    /// 行数是否已到位(快扫一落地即真;体积另看 `scan.sized`)。
+    /// 空库时恒假,但那时也没有可显示的行,无影响。
+    fn rows_ready(&self) -> bool {
+        self.scan.total_rows > 0 || self.scan_ready()
     }
 
     /// 当前是否有不能立即中断的后台任务;返回它的名字用于提示。
@@ -330,18 +367,38 @@ impl App {
         self.quit_requested && self.busy_reason().is_none()
     }
 
+    /// 会话列表变化后重算 workspaceId → 标签映射(读若干 workspace.json,毫秒级)。
+    fn refresh_workspaces(&mut self) {
+        self.workspaces = crate::workspace::resolve(&self.sessions, &self.db_path);
+    }
+
+    /// 工作区显示标签。`""` 是"无归属"哨兵(见 `ws_filter`)。
+    fn ws_label_of(&self, wid: &str) -> String {
+        if wid.is_empty() {
+            return "(无归属)".into();
+        }
+        self.workspaces.get(wid).map_or_else(
+            || wid.chars().take(8).collect(),
+            |info| info.label.clone(),
+        )
+    }
+
     fn rebuild_entries(&mut self) {
         // 在旧的 visible/entries 一致状态上取光标 id,再整体替换——
         // 顺序颠倒会拿旧下标查新(可能变小的)entries,直接越界。
         let keep = self.current_entry().map(|e| e.composer_id.clone());
         let live_ids: FxHashSet<&str> =
             self.sessions.iter().map(|s| s.composer_id.as_str()).collect();
-        let deep = self.scan_ready();
+        let sized = self.scan.sized;
         let mut entries: Vec<Entry> = self
             .sessions
             .iter()
             .map(|s| {
                 let stat = self.scan.per_composer.get(&s.composer_id);
+                let ws_label = s
+                    .workspace_id
+                    .as_deref()
+                    .map(|wid| self.ws_label_of(wid));
                 Entry {
                     composer_id: s.composer_id.clone(),
                     name: s.name.clone(),
@@ -350,7 +407,9 @@ impl App {
                     is_subagent: s.is_subagent,
                     live: true,
                     rows: stat.map_or(0, |c| c.rows),
-                    bytes: deep.then(|| stat.map_or(0, |c| c.bytes)),
+                    bytes: sized.then(|| stat.map_or(0, |c| c.bytes)),
+                    workspace_id: s.workspace_id.clone(),
+                    ws_label,
                 }
             })
             .collect();
@@ -364,7 +423,9 @@ impl App {
                     is_subagent: false,
                     live: false,
                     rows: stat.rows,
-                    bytes: deep.then_some(stat.bytes),
+                    bytes: sized.then_some(stat.bytes),
+                    workspace_id: None,
+                    ws_label: None,
                 });
             }
         }
@@ -391,6 +452,13 @@ impl App {
                     .as_deref()
                     .unwrap_or("\u{10FFFF}")
                     .cmp(b.name.as_deref().unwrap_or("\u{10FFFF}")),
+                // 同工作区相邻(形成分组视觉),组内按时间降序
+                SortKey::Workspace => a
+                    .ws_label
+                    .as_deref()
+                    .unwrap_or("\u{10FFFF}")
+                    .cmp(b.ws_label.as_deref().unwrap_or("\u{10FFFF}"))
+                    .then(b.recency.cmp(&a.recency)),
             };
             if self.reverse { ord.reverse() } else { ord }
         });
@@ -405,10 +473,16 @@ impl App {
                 View::Orphans => !e.live,
                 View::Archived => e.is_archived,
             })
+            .filter(|(_, e)| match &self.ws_filter {
+                None => true,
+                Some(w) if w.is_empty() => e.workspace_id.is_none(),
+                Some(w) => e.workspace_id.as_deref() == Some(w),
+            })
             .filter(|(_, e)| {
                 query.is_empty()
                     || e.composer_id.starts_with(&query)
                     || e.name.as_deref().is_some_and(|n| n.to_lowercase().contains(&query))
+                    || e.ws_label.as_deref().is_some_and(|w| w.to_lowercase().contains(&query))
             })
             .map(|(i, _)| i)
             .collect();
@@ -451,7 +525,7 @@ impl App {
         let live = match headers::live_set(&self.sessions) {
             Ok(l) => l,
             Err(e) => {
-                self.status = Some(format!("存活集合构建失败: {e:#}"));
+                self.status = Some(format!("存活集合构建失败: {}", e.render()));
                 return;
             }
         };
@@ -461,12 +535,24 @@ impl App {
         let collect = self.maint.engaged();
         let (generation, p) = self.begin_scan_task();
         std::thread::spawn(move || {
-            let r = db::with_analysis(&path, |conn| {
+            // 第一段: covering-index 快扫(不触数据页,秒级),
+            // 行数/孤儿/待删清单先到位,列表立即可排序可操作。
+            let fast = db::with_analysis(&path, |conn| {
+                let _guard = db::CancelGuard::install(conn, p.clone());
+                scan::scan_keys(conn, &live, false, collect, &p)
+            });
+            let fast_failed = fast.is_err();
+            let _ = tx.send(TaskMsg::Scan(generation, fast));
+            if fast_failed {
+                return;
+            }
+            // 第二段: 深扫读数据页补体积(成本与库体积成正比)。
+            let deep = db::with_analysis(&path, |conn| {
                 // 连接级取消: COUNT 与行迭代都能被即时打断
                 let _guard = db::CancelGuard::install(conn, p.clone());
                 scan::scan_keys(conn, &live, true, collect, &p)
             });
-            let _ = tx.send(TaskMsg::Scan(generation, r));
+            let _ = tx.send(TaskMsg::Scan(generation, deep));
         });
     }
 
@@ -589,18 +675,22 @@ impl App {
                 // 被取代的旧扫描: 结果与错误一律丢弃,状态由新任务负责
                 TaskMsg::Scan(g, _) | TaskMsg::Entered(g, _) if g != self.scan_gen => {}
                 TaskMsg::Scan(_, Ok(scan)) => {
+                    let sized = scan.sized;
                     self.scan = scan;
-                    self.scan_state = ScanState::Ready;
-                    if self.sort == SortKey::Recency {
-                        self.sort = SortKey::Bytes;
+                    // 快扫结果先上屏(行数/孤儿),扫描态保持到深扫补完体积
+                    if sized {
+                        self.scan_state = ScanState::Ready;
+                        if self.sort == SortKey::Recency {
+                            self.sort = SortKey::Bytes;
+                        }
                     }
                     self.rebuild_entries();
                 }
                 TaskMsg::Scan(_, Err(e)) => {
-                    self.status = Some(if is_cancelled(&e) {
+                    self.status = Some(if e.is_cancelled() {
                         "扫描已取消。".into()
                     } else {
-                        format!("扫描失败: {e:#}")
+                        format!("扫描失败: {}", e.render())
                     });
                     self.scan_state = ScanState::Ready;
                 }
@@ -616,7 +706,7 @@ impl App {
                         }
                         Err(e) => {
                             self.op = OpState::Idle;
-                            self.status = Some(format!("预览失败: {e:#}"));
+                            self.status = Some(format!("预览失败: {}", e.render()));
                         }
                     }
                 }
@@ -633,18 +723,22 @@ impl App {
                                 _ => db::with_analysis(&self.db_path, headers::load_union),
                             };
                             match reloaded {
-                                Ok(sessions) => self.sessions = sessions,
-                                Err(e) => self.status = Some(format!("刷新失败: {e:#}")),
+                                Ok(sessions) => {
+                                    self.sessions = sessions;
+                                    self.refresh_workspaces();
+                                }
+                                Err(e) => self.status = Some(format!("刷新失败: {}", e.render())),
                             }
                             // 增量修正统计,免去整库重扫(r 键可全量校准)
                             self.apply_patch(patch);
                         }
-                        Err(e) => self.status = Some(format!("执行失败: {e:#}")),
+                        Err(e) => self.status = Some(format!("执行失败: {}", e.render())),
                     }
                 }
                 TaskMsg::Entered(_, Ok((maint, sessions, scan))) => {
                     self.maint = MaintState::Held(maint);
                     self.sessions = sessions;
+                    self.refresh_workspaces();
                     self.scan = *scan;
                     self.scan_state = ScanState::Ready;
                     if self.sort == SortKey::Recency {
@@ -656,10 +750,10 @@ impl App {
                 TaskMsg::Entered(_, Err(e)) => {
                     self.maint = MaintState::Off;
                     self.scan_state = ScanState::Ready;
-                    if is_cancelled(&e) {
+                    if e.is_cancelled() {
                         self.status = Some("已中止维护模式启动,数据库锁已释放。".into());
                     } else {
-                        self.status = Some(format!("进入维护模式失败: {e:#}"));
+                        self.status = Some(format!("进入维护模式失败: {}", e.render()));
                         // 启动普通扫描顶回来: 进入维护时把原扫描取代掉了,
                         // 失败后不能让界面停在"无数据"状态
                         if !self.quit_requested {
@@ -675,7 +769,7 @@ impl App {
                             fmt_bytes(pending)
                         ),
                         Ok(_) => "已退出维护模式。".into(),
-                        Err(e) => format!("退出维护模式时出错: {e:#}"),
+                        Err(e) => format!("退出维护模式时出错: {}", e.render()),
                     });
                 }
             }
@@ -772,10 +866,59 @@ impl App {
             Ok((crate::vacuum::Strategy::Incremental, _)) => Some(Action::Shrink),
             Ok((crate::vacuum::Strategy::Full, _)) => Some(Action::VacuumFull),
             Err(e) => {
-                self.status = Some(format!("无法评估空闲页: {e:#}"));
+                self.status = Some(format!("无法评估空闲页: {}", e.render()));
                 None
             }
         }
+    }
+
+    /// 打开工作区选择层: 按工作区聚合会话数与体积,首行"全部"清除过滤。
+    fn open_ws_picker(&mut self) {
+        let deep = self.scan.sized;
+        // wid("" = 无归属) → (会话数, 字节数)
+        let mut agg: rustc_hash::FxHashMap<String, (u64, u64)> =
+            rustc_hash::FxHashMap::default();
+        for s in &self.sessions {
+            let wid = s.workspace_id.clone().unwrap_or_default();
+            let bytes = self.scan.per_composer.get(&s.composer_id).map_or(0, |c| c.bytes);
+            let e = agg.entry(wid).or_default();
+            e.0 += 1;
+            e.1 += bytes;
+        }
+        let mut rows: Vec<WsRow> = agg
+            .into_iter()
+            .map(|(wid, (sessions, bytes))| WsRow {
+                label: self.ws_label_of(&wid),
+                id: Some(wid),
+                sessions,
+                bytes: deep.then_some(bytes),
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            b.bytes
+                .unwrap_or(0)
+                .cmp(&a.bytes.unwrap_or(0))
+                .then(b.sessions.cmp(&a.sessions))
+                .then(a.label.cmp(&b.label))
+        });
+        let total_bytes = deep.then(|| rows.iter().map(|r| r.bytes.unwrap_or(0)).sum());
+        rows.insert(
+            0,
+            WsRow {
+                id: None,
+                label: "全部".into(),
+                sessions: self.sessions.len() as u64,
+                bytes: total_bytes,
+            },
+        );
+        // 光标落在当前过滤项上
+        let cursor = self
+            .ws_filter
+            .as_ref()
+            .and_then(|w| rows.iter().position(|r| r.id.as_deref() == Some(w)))
+            .unwrap_or(0);
+        self.ws_picker =
+            Some(WsPicker { rows, table: TableState::default().with_selected(cursor) });
     }
 
     /// 动作目标: 已多选的,否则光标所在的存活会话。
@@ -1188,10 +1331,53 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<
             continue;
         }
 
+        // 工作区选择层独占键盘
+        if app.ws_picker.is_some() {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('w') | KeyCode::Char('q') => app.ws_picker = None,
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if let Some(p) = &mut app.ws_picker {
+                        let max = p.rows.len().saturating_sub(1);
+                        let cur = p.table.selected().unwrap_or(0);
+                        p.table.select(Some((cur + 1).min(max)));
+                    }
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if let Some(p) = &mut app.ws_picker {
+                        let cur = p.table.selected().unwrap_or(0);
+                        p.table.select(Some(cur.saturating_sub(1)));
+                    }
+                }
+                KeyCode::Home | KeyCode::Char('g') => {
+                    if let Some(p) = &mut app.ws_picker {
+                        p.table.select(Some(0));
+                    }
+                }
+                KeyCode::End | KeyCode::Char('G') => {
+                    if let Some(p) = &mut app.ws_picker {
+                        p.table.select(Some(p.rows.len().saturating_sub(1)));
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(p) = app.ws_picker.take() {
+                        let cursor = p.table.selected().unwrap_or(0);
+                        app.ws_filter = p.rows.get(cursor).and_then(|r| r.id.clone());
+                        app.sort_and_refilter();
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
         match key.code {
             // Esc 优先用于就地取消(清过滤 / 中止启动),q 一律是退出意图
             KeyCode::Esc if !app.filter.is_empty() => {
                 app.filter.clear();
+                app.sort_and_refilter();
+            }
+            KeyCode::Esc if app.ws_filter.is_some() => {
+                app.ws_filter = None;
                 app.sort_and_refilter();
             }
             KeyCode::Esc if matches!(app.maint, MaintState::Entering { .. }) => {
@@ -1299,23 +1485,12 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<
                     app.status = Some("维护会话忙,请稍候。".into());
                 }
             },
+            KeyCode::Char('w') => app.open_ws_picker(),
             KeyCode::Char('x') => app.start_preview(Action::Sweep),
             KeyCode::Char('c') => app.start_preview(Action::Gc),
             _ => {}
         }
     }
-}
-
-/// 错误链里是否是主动取消(与真实故障区分开,文案与后续处理都不同)。
-/// 两种形态: 循环检查点返回的 [`Cancelled`],以及连接级 progress handler
-/// 打断正在执行的 SQL 产生的 `SQLITE_INTERRUPT`。
-fn is_cancelled(e: &anyhow::Error) -> bool {
-    e.chain().any(|c| {
-        c.downcast_ref::<crate::progress::Cancelled>().is_some()
-            || c.downcast_ref::<rusqlite::Error>()
-                .and_then(|re| re.sqlite_error_code())
-                .is_some_and(|code| code == rusqlite::ErrorCode::OperationInterrupted)
-    })
 }
 
 fn fmt_bytes(b: u64) -> String {
@@ -1389,6 +1564,9 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
         format!("视图:{} ", app.view.label()).into(),
         format!("排序:{}{} ", app.sort.label(), if app.reverse { "↑" } else { "↓" }).into(),
     ];
+    if let Some(w) = &app.ws_filter {
+        title_parts.push(format!("工作区:{} ", app.ws_label_of(w)).fg(Color::Green));
+    }
     if !app.filter.is_empty() || app.input == InputMode::Filter {
         let editing = app.input == InputMode::Filter;
         title_parts.push(
@@ -1399,13 +1577,14 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
     f.render_widget(Line::from(title_parts), title_area);
 
     // 会话表
-    let header = Row::new(["", "体积", "行数", "最后更新", "标记", "名称", "composerId"])
-        .style(Style::new().add_modifier(Modifier::BOLD).fg(Color::Cyan));
+    let header =
+        Row::new(["", "体积", "行数", "最后更新", "标记", "工作区", "名称", "composerId"])
+            .style(Style::new().add_modifier(Modifier::BOLD).fg(Color::Cyan));
     let rows = app.visible.iter().map(|&i| {
         let e = &app.entries[i];
         let sel = if app.selected_ids.contains(&e.composer_id) { "✓" } else { "" };
         let bytes = e.bytes.map_or("…".into(), fmt_bytes);
-        let rows = if app.scan_ready() { e.rows.to_string() } else { "…".into() };
+        let rows = if app.rows_ready() { e.rows.to_string() } else { "…".into() };
         let time = if e.recency > 0 { fmt_time(e.recency) } else { "-".into() };
         let mut marks = String::new();
         if !e.live {
@@ -1433,6 +1612,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
             rows,
             time,
             marks,
+            e.ws_label.clone().unwrap_or_else(|| "-".into()),
             name.to_string(),
             e.composer_id.chars().take(8).collect(),
         ])
@@ -1446,6 +1626,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
             Constraint::Length(7),
             Constraint::Length(16),
             Constraint::Length(4),
+            Constraint::Length(18),
             Constraint::Fill(1),
             Constraint::Length(10),
         ],
@@ -1516,7 +1697,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
             )
             .into(),
             format!("| 孤儿可回收 {} ", fmt_bytes(orphan)).fg(Color::Yellow),
-            "[空格]选 [d]删 [t]修剪 [x]清扫 [c]GC [v]收缩 [r]重扫 [M]维护".dim(),
+            "[空格]选 [w]工作区 [d]删 [t]修剪 [x]清扫 [c]GC [v]收缩 [r]重扫 [M]维护".dim(),
         ])
     } else {
         // 仅在"维护模式 + 扫描中 + 无状态消息"时到达
@@ -1566,7 +1747,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
 导航     j/k ↑/↓ PgUp/PgDn g/G
 排序     s 切换字段   S 反向
 视图     Tab 全部/孤儿/归档
-过滤     / 输入,Enter 确定,Esc 清除
+工作区   w 打开选择层按工作区过滤,Esc 清除
+过滤     / 输入,Enter 确定,Esc 清除(也匹配工作区名)
 详情     Enter
 选择     空格(多选)
 清理     d 删除会话   t 修剪快照(保留正文)
@@ -1610,10 +1792,23 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
                     "最后更新    ".dim(),
                     h.last_updated_at.map_or("-".into(), fmt_time).into(),
                 ]));
-                lines.push(Line::from(vec![
-                    "workspace   ".dim(),
-                    h.workspace_id.clone().unwrap_or_else(|| "-".into()).into(),
-                ]));
+                match &h.workspace_id {
+                    Some(wid) => {
+                        lines.push(Line::from(vec![
+                            "工作区      ".dim(),
+                            app.ws_label_of(wid).into(),
+                        ]));
+                        if let Some(folder) =
+                            app.workspaces.get(wid).and_then(|i| i.folder.clone())
+                        {
+                            lines.push(Line::from(vec!["            ".dim(), folder.dim()]));
+                        }
+                        lines.push(Line::from(vec!["workspaceId ".dim(), wid.clone().into()]));
+                    }
+                    None => {
+                        lines.push(Line::from(vec!["工作区      ".dim(), "-".into()]));
+                    }
+                }
                 if let Some(parent) = &h.parent_composer_id {
                     lines.push(Line::from(vec!["父会话      ".dim(), parent.clone().into()]));
                 }
@@ -1667,6 +1862,45 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
             );
         }
     }
+
+    // 工作区选择层
+    if let Some(picker) = &mut app.ws_picker {
+        let area = centered_rect(60, 60, f.area());
+        f.render_widget(Clear, area);
+        let active = app.ws_filter.as_deref();
+        let header = Row::new(["", "工作区", "会话", "体积"])
+            .style(Style::new().add_modifier(Modifier::BOLD).fg(Color::Cyan));
+        let rows = picker.rows.iter().map(|r| {
+            let current = match (&r.id, active) {
+                (None, None) => true,
+                (Some(id), Some(w)) => id == w,
+                _ => false,
+            };
+            Row::new([
+                if current { "●" } else { "" }.to_string(),
+                r.label.clone(),
+                r.sessions.to_string(),
+                r.bytes.map_or("…".into(), fmt_bytes),
+            ])
+        });
+        let table = Table::new(
+            rows,
+            [
+                Constraint::Length(1),
+                Constraint::Fill(1),
+                Constraint::Length(6),
+                Constraint::Length(10),
+            ],
+        )
+        .header(header)
+        .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED))
+        .block(
+            Block::bordered()
+                .title(" 按工作区过滤(Enter 选择,Esc/w 关闭) ")
+                .border_style(Style::new().fg(Color::Green)),
+        );
+        f.render_stateful_widget(table, area, &mut picker.table);
+    }
 }
 
 #[cfg(test)]
@@ -1683,6 +1917,8 @@ mod tests {
             live,
             rows: bytes / 10,
             bytes: Some(bytes),
+            workspace_id: None,
+            ws_label: None,
         }
     }
 
@@ -1699,6 +1935,9 @@ mod tests {
             reverse: false,
             view: View::All,
             filter: String::new(),
+            ws_filter: None,
+            workspaces: rustc_hash::FxHashMap::default(),
+            ws_picker: None,
             input: InputMode::Normal,
             table: TableState::default().with_selected(0),
             selected_ids: FxHashSet::default(),
@@ -1807,12 +2046,80 @@ mod tests {
         assert_eq!(app.scan.total_rows, 0, "过期结果不得写入");
         assert!(!app.scan_ready(), "过期结果不得结束扫描态");
 
-        // 当前任务的结果正常生效
-        let fresh = scan::ScanResult { total_rows: 42, ..Default::default() };
-        app.tx.send(TaskMsg::Scan(g2, Ok(fresh))).unwrap();
+        // 当前任务的快扫结果生效但不结束扫描态(体积还没到)
+        let fast = scan::ScanResult { total_rows: 42, ..Default::default() };
+        app.tx.send(TaskMsg::Scan(g2, Ok(fast))).unwrap();
         app.poll_background();
         assert_eq!(app.scan.total_rows, 42);
+        assert!(app.rows_ready(), "快扫落地后行数可用");
+        assert!(!app.scan_ready(), "体积未到,扫描态保持");
+
+        // 深扫结果落地才结束扫描态
+        let deep = scan::ScanResult { total_rows: 42, sized: true, ..Default::default() };
+        app.tx.send(TaskMsg::Scan(g2, Ok(deep))).unwrap();
+        app.poll_background();
         assert!(app.scan_ready());
+    }
+
+    #[test]
+    fn workspace_filter_and_text_match() {
+        let mut a = entry("aaaa-1", Some("a"), 300, true, false);
+        a.workspace_id = Some("w1".into());
+        a.ws_label = Some("proj-one".into());
+        let mut b = entry("bbbb-2", Some("b"), 200, true, false);
+        b.workspace_id = Some("w2".into());
+        b.ws_label = Some("proj-two".into());
+        let c = entry("cccc-3", None, 100, false, false); // 孤儿,无归属
+        let mut app = mk_app(vec![a, b, c]);
+
+        // 按 workspaceId 过滤
+        app.ws_filter = Some("w1".into());
+        app.sort_and_refilter();
+        assert_eq!(visible_ids(&app), vec!["aaaa-1"]);
+
+        // "" 哨兵 = 无归属
+        app.ws_filter = Some(String::new());
+        app.sort_and_refilter();
+        assert_eq!(visible_ids(&app), vec!["cccc-3"]);
+
+        // 文本过滤也匹配工作区标签
+        app.ws_filter = None;
+        app.filter = "proj-two".into();
+        app.sort_and_refilter();
+        assert_eq!(visible_ids(&app), vec!["bbbb-2"]);
+    }
+
+    fn session(cid: &str, wid: Option<&str>) -> headers::SessionHeader {
+        headers::SessionHeader {
+            composer_id: cid.into(),
+            name: None,
+            created_at: None,
+            last_updated_at: None,
+            recency: 0,
+            is_archived: false,
+            is_subagent: false,
+            workspace_id: wid.map(str::to_owned),
+            workspace_folder: None,
+            parent_composer_id: None,
+            in_header_table: true,
+            in_legacy_blob: false,
+        }
+    }
+
+    #[test]
+    fn ws_picker_aggregates_and_leads_with_all() {
+        let mut app = mk_app(vec![]);
+        app.sessions =
+            vec![session("a", Some("w1")), session("b", Some("w1")), session("c", None)];
+        app.open_ws_picker();
+        let p = app.ws_picker.as_ref().unwrap();
+        assert_eq!(p.rows[0].label, "全部");
+        assert_eq!(p.rows[0].sessions, 3);
+        let w1 = p.rows.iter().find(|r| r.id.as_deref() == Some("w1")).unwrap();
+        assert_eq!(w1.sessions, 2);
+        let none = p.rows.iter().find(|r| r.id.as_deref() == Some("")).unwrap();
+        assert_eq!(none.label, "(无归属)");
+        assert_eq!(none.sessions, 1);
     }
 
     #[test]

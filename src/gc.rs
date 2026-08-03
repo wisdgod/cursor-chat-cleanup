@@ -6,11 +6,11 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, ensure};
 use rusqlite::Connection;
 use rusqlite::types::ValueRef;
 use rustc_hash::FxHashMap;
 
+use crate::error::{Error, Result};
 use crate::{headers, mark, safety, sweep};
 
 /// 根解码失败率超过该值即拒绝清理(数据可能损坏)。
@@ -158,7 +158,9 @@ pub fn apply(
 
     let sessions = headers::load_union(&conn)?;
     let live = headers::live_set(&sessions)?;
-    ensure!(!live.is_empty(), "存活会话集合为空,拒绝清理(库不对或已损坏?)");
+    if live.is_empty() {
+        return Err(Error::EmptyLiveSet { action: "清理" });
+    }
 
     let plan = plan(&conn, &live, p)?;
     apply_plan(&mut conn, db_path, plan, make_backup, true, p)
@@ -178,17 +180,16 @@ pub fn apply_plan(
     p: &crate::progress::Progress,
 ) -> Result<GcOutcome> {
     // 安全阀: 根解码失败率过高说明数据可能损坏,删除不可逆,拒绝。
-    ensure!(
-        plan.root_error_rate <= ROOT_ERROR_RATE_LIMIT,
-        "根解码失败率 {:.2}% 超过阈值 {:.0}%,数据可能损坏,拒绝清理",
-        plan.root_error_rate * 100.0,
-        ROOT_ERROR_RATE_LIMIT * 100.0,
-    );
+    if plan.root_error_rate > ROOT_ERROR_RATE_LIMIT {
+        return Err(Error::RootErrorRate {
+            rate: plan.root_error_rate,
+            limit: ROOT_ERROR_RATE_LIMIT,
+        });
+    }
     // mark 一个根都没解出来时删除等于全删,同样拒绝。
-    ensure!(
-        plan.stats.root_states > 0 || plan.orphans.is_empty(),
-        "没有成功解码任何会话根,拒绝清理",
-    );
+    if plan.stats.root_states == 0 && !plan.orphans.is_empty() {
+        return Err(Error::NoDecodedRoots);
+    }
 
     let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
     let page_count_before: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
@@ -451,10 +452,14 @@ mod tests {
         drop(conn);
 
         let err = match apply(&db, false, &crate::progress::Progress::new()) {
-            Err(e) => e.to_string(),
+            Err(e) => e,
             Ok(_) => panic!("高失败率时应当中止"),
         };
-        assert!(err.contains("拒绝清理"), "实际错误: {err}");
+        assert!(
+            matches!(err, Error::RootErrorRate { .. }),
+            "实际错误: {}",
+            err.render()
+        );
         let _ = std::fs::remove_file(&db);
     }
 }

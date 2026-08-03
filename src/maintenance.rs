@@ -10,9 +10,9 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
 use rusqlite::Connection;
 
+use crate::error::{Ctx as _, Result};
 use crate::safety;
 
 /// 持锁的维护会话。`drop` 即释放锁(连接关闭),
@@ -29,10 +29,9 @@ impl Maintenance {
     pub fn acquire(db_path: &Path) -> Result<Self> {
         let conn = safety::open_write_gated(db_path)?;
         conn.pragma_update(None, "locking_mode", "EXCLUSIVE")
-            .context("设置 locking_mode=EXCLUSIVE 失败")?;
+            .ctx("设置 locking_mode=EXCLUSIVE 失败")?;
         // locking_mode 在下一次访问时生效;做一笔空写事务实际取得并持有锁
-        conn.execute_batch("BEGIN IMMEDIATE; COMMIT;")
-            .context("取得排他锁失败")?;
+        conn.execute_batch("BEGIN IMMEDIATE; COMMIT;").ctx("取得排他锁失败")?;
         Ok(Self { conn, db_path: db_path.to_owned(), writes: 0 })
     }
 

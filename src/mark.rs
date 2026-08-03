@@ -13,7 +13,6 @@
 
 use std::collections::VecDeque;
 
-use anyhow::{Context, Result};
 use base64::Engine as _;
 use buffa::MessageView as _;
 use rusqlite::Connection;
@@ -21,6 +20,7 @@ use rusqlite::types::ValueRef;
 use rustc_hash::FxHashSet;
 use serde_json::Value;
 
+use crate::error::{Ctx as _, Result};
 use crate::proto::agent::v1 as pb;
 use crate::scan::{Attribution, attribute};
 use crate::types::{BlobHex, hex_decode, hex_decode_into};
@@ -378,7 +378,7 @@ pub fn mark_live_blobs(
                 }
                 Ok(_) => {}
                 Err(rusqlite::Error::QueryReturnedNoRows) => m.stats.missing_blobs += 1,
-                Err(e) => return Err(e).context("读取 blob 失败"),
+                Err(e) => return Err(e).ctx("读取 blob 失败"),
             }
         }
     }
@@ -396,10 +396,20 @@ struct ConversationStateField<'a> {
     conversation_state: Option<std::borrow::Cow<'a, str>>,
 }
 
+/// 根解码失败的形态。调用方只按 Ok/Err 计数(安全阀分子),
+/// 从不传播——因此不进 crate::Error,保留结构以便调试时可见。
+#[derive(Debug)]
+#[allow(dead_code)] // 字段仅用于 Debug 输出
+enum RootDecodeError {
+    Json(serde_json::Error),
+    Base64(base64::DecodeError),
+    Hex,
+}
+
 /// 官方解码语义: JSON 的 conversationState 字段,`~` 前缀 base64,否则 hex。
-fn decode_conversation_state(json_bytes: &[u8]) -> Result<Option<Vec<u8>>> {
+fn decode_conversation_state(json_bytes: &[u8]) -> Result<Option<Vec<u8>>, RootDecodeError> {
     let f: ConversationStateField<'_> =
-        serde_json::from_slice(json_bytes).context("JSON 解析失败")?;
+        serde_json::from_slice(json_bytes).map_err(RootDecodeError::Json)?;
     let Some(s) = f.conversation_state else {
         return Ok(None);
     };
@@ -410,9 +420,9 @@ fn decode_conversation_state(json_bytes: &[u8]) -> Result<Option<Vec<u8>>> {
     let bytes = if let Some(b64) = s.strip_prefix('~') {
         base64::engine::general_purpose::STANDARD
             .decode(b64)
-            .context("base64 解码失败")?
+            .map_err(RootDecodeError::Base64)?
     } else {
-        hex_decode(s).context("hex 解码失败")?
+        hex_decode(s).ok_or(RootDecodeError::Hex)?
     };
     Ok((!bytes.is_empty()).then_some(bytes))
 }

@@ -9,8 +9,9 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
+
+use crate::error::{Ctx as _, Error, Result};
 
 /// `-wal` 文件最近一次修改距今的时长。不存在则返回 None。
 pub fn wal_age(db_path: &Path) -> Option<Duration> {
@@ -26,24 +27,20 @@ pub fn open_write_gated(db_path: &Path) -> Result<Connection> {
     if let Some(age) = wal_age(db_path)
         && age < Duration::from_secs(15)
     {
-        bail!(
-            "-wal 文件 {} 秒前刚被写入,Cursor 很可能正在运行。\n\
-             请完全退出 Cursor(不只是关窗口)后重试。",
-            age.as_secs()
-        );
+        return Err(Error::CursorRunning { age_secs: age.as_secs() });
     }
 
     let conn = Connection::open(db_path)
-        .with_context(|| format!("打开数据库失败: {}", db_path.display()))?;
+        .map_err(|source| Error::OpenDb { path: db_path.to_owned(), source })?;
     conn.busy_timeout(Duration::ZERO)?;
     if let Err(e) = conn.execute_batch("BEGIN EXCLUSIVE; ROLLBACK;") {
         let busy = e
             .sqlite_error_code()
             .is_some_and(|c| matches!(c, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked));
         if busy {
-            bail!("数据库正被其它连接占用(Cursor 可能正在运行)。请完全退出 Cursor 后重试。");
+            return Err(Error::DbBusy);
         }
-        return Err(e).context("排他锁探测失败");
+        return Err(e).ctx("排他锁探测失败");
     }
     conn.busy_timeout(Duration::from_secs(30))?;
     Ok(conn)
@@ -52,7 +49,7 @@ pub fn open_write_gated(db_path: &Path) -> Result<Connection> {
 /// 写操作收尾: 把 WAL checkpoint 回主库并截断,不留 hot journal。
 pub fn checkpoint_truncate(conn: &Connection) -> Result<()> {
     conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
-        .context("WAL checkpoint 失败")?;
+        .ctx("WAL checkpoint 失败")?;
     Ok(())
 }
 

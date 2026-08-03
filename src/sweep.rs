@@ -2,7 +2,8 @@
 //!
 //! 只删两类行,都是 Cursor 界面上不可见的死数据:
 //! 1. 归属某个 composer、但该 composer 不在任何 header 来源里的行(孤儿);
-//! 2. 会话前缀下 value 为 NULL 的行(官方 set-NULL 删除 bug 留下的墓碑)。
+//! 2. `composerData:` 下 value 为 NULL 的行(官方 set-NULL 删除 bug 留下的
+//!    墓碑;该 bug 是唯一的 NULL 写入点且只写此前缀,见逆向报告 6.3)。
 //!
 //! `agentKv:blob:`(归属要 mark 才知道)、`composer.content.`(无 owner)、
 //! `agentKv:artifact:` 与迁移锁(硬约束)一律不碰。
@@ -13,11 +14,11 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, ensure};
 use rusqlite::Connection;
 use rusqlite::types::Value;
 use rustc_hash::FxHashSet;
 
+use crate::error::{Ctx as _, Error, Result};
 use crate::scan::{Attribution, PrefixStat, attribute};
 use crate::{headers, safety};
 
@@ -31,8 +32,11 @@ pub struct SweepPlan {
 }
 
 /// 计算清扫计划。`conn` 可以是只读分析连接(dry-run)或写连接(apply)。
-/// `with_bytes=false` 时不读 `octet_length`(免触值页,快一个数量级),
+///
+/// `with_bytes=false` 时走 covering index(不触任何数据页,3GB 库约 2 秒),
 /// `total_bytes`/per_prefix bytes 为 0——apply 内部重算计划时用。
+/// `with_bytes=true` 读 `octet_length` 必须触全部数据页,成本与库体积成正比。
+/// 两档产出的 key 清单**逐项一致**(判据同 `scan::scan_keys`)。
 pub fn plan(
     conn: &Connection,
     live: &crate::types::LiveSet,
@@ -47,11 +51,13 @@ pub fn plan(
     let mut tombstone_rows = 0u64;
     let mut total_bytes = 0u64;
 
+    // 快速档绝不引用 value 列(连 `value IS NULL` 都会把查询计划从
+    // covering index 打回全表扫,见 scan.rs 模块文档),墓碑在循环后补齐。
     let sql = if with_bytes {
         "SELECT key, COALESCE(octet_length(value), 0), value IS NULL
          FROM cursorDiskKV WHERE key IS NOT NULL"
     } else {
-        "SELECT key, 0, value IS NULL FROM cursorDiskKV WHERE key IS NOT NULL"
+        "SELECT key FROM cursorDiskKV WHERE key IS NOT NULL"
     };
     let mut stmt = conn.prepare(sql)?;
     let mut rows = stmt.query([])?;
@@ -66,16 +72,18 @@ pub fn plan(
 
         // 先判定归属再分配,绝大多数行在这里被跳过
         let Attribution::Owned(prefix, cid) = attribute(key) else { continue };
-        let is_null: bool = row.get(2)?;
+        // 墓碑只存在于 composerData:(见模块文档),与 scan 同一判据
+        let is_tombstone =
+            with_bytes && prefix == "composerData" && row.get::<_, bool>(2)?;
         let orphan = !live.contains(cid);
-        if !orphan && !is_null {
+        if !orphan && !is_tombstone {
             continue;
         }
-        let bytes = row.get::<_, i64>(1)?.max(0) as u64;
+        let bytes = if with_bytes { row.get::<_, i64>(1)?.max(0) as u64 } else { 0 };
         if orphan && !orphans.contains(cid) {
             orphans.insert(cid.to_owned());
         }
-        if is_null {
+        if is_tombstone {
             tombstone_rows += 1;
         }
         let stat = per_prefix.entry(prefix).or_default();
@@ -83,6 +91,19 @@ pub fn plan(
         stat.bytes += bytes;
         total_bytes += bytes;
         keys.push(key.to_owned());
+    }
+
+    // 快速档的墓碑补齐(范围扫,毫秒级)。计数与深度档一致(含孤儿墓碑);
+    // 孤儿墓碑的 key 已按孤儿收进清单与 per_prefix,只补存活的。
+    if !with_bytes {
+        for key in crate::scan::tombstone_keys(conn)? {
+            let Attribution::Owned(prefix, cid) = attribute(&key) else { continue };
+            tombstone_rows += 1;
+            if live.contains(cid) {
+                per_prefix.entry(prefix).or_default().rows += 1;
+                keys.push(key);
+            }
+        }
     }
 
     Ok(SweepPlan {
@@ -117,7 +138,9 @@ pub fn apply(
     let sessions = headers::load_union(&conn)?;
     let live = headers::live_set(&sessions)?;
     // 安全阀: 存活集合为空基本只可能是读错了库;清扫会删掉所有会话数据,拒绝。
-    ensure!(!live.is_empty(), "存活会话集合为空,拒绝清扫(库不对或已损坏?)");
+    if live.is_empty() {
+        return Err(Error::EmptyLiveSet { action: "清扫" });
+    }
 
     // apply 只需要 key,跳过值页读取
     let plan = plan(&conn, &live, false, p)?;
@@ -223,9 +246,11 @@ pub fn write_backup(
     p: &crate::progress::Progress,
 ) -> Result<()> {
     p.stage("备份将删数据", keys.len() as u64);
-    ensure!(!path.exists(), "备份文件已存在: {}", path.display());
+    if path.exists() {
+        return Err(Error::BackupExists { path: path.to_owned() });
+    }
     let bk = Connection::open(path)
-        .with_context(|| format!("创建备份库失败: {}", path.display()))?;
+        .map_err(|source| Error::CreateBackup { path: path.to_owned(), source })?;
     bk.execute_batch(
         "PRAGMA journal_mode = OFF;
          PRAGMA synchronous = OFF;
@@ -251,7 +276,7 @@ pub fn write_backup(
                 ins.execute(rusqlite::params![key, v])?;
             }
             Err(rusqlite::Error::QueryReturnedNoRows) => {}
-            Err(e) => return Err(e).context("读取待备份行失败"),
+            Err(e) => return Err(e).ctx("读取待备份行失败"),
         }
     }
     bk.execute_batch("COMMIT")?;
@@ -269,12 +294,14 @@ pub struct RestoreOutcome {
 /// 从 sidecar 备份整体回灌。sweep/gc 的备份只有 cursorDiskKV 行;
 /// delete 的备份还带 header 行与 ItemTable JSON 快照(含 workspace 库),一并恢复。
 pub fn restore(db_path: &Path, backup_path: &Path) -> Result<RestoreOutcome> {
-    ensure!(backup_path.exists(), "备份文件不存在: {}", backup_path.display());
+    if !backup_path.exists() {
+        return Err(Error::BackupMissing { path: backup_path.to_owned() });
+    }
     let conn = safety::open_write_gated(db_path)?;
-    conn.execute(
-        "ATTACH DATABASE ?1 AS bk",
-        [backup_path.to_str().context("备份路径不是合法 UTF-8")?],
-    )?;
+    let backup_str = backup_path
+        .to_str()
+        .ok_or_else(|| Error::BackupPathNotUtf8 { path: backup_path.to_owned() })?;
+    conn.execute("ATTACH DATABASE ?1 AS bk", [backup_str])?;
     let kv_rows = conn.execute(
         "INSERT OR REPLACE INTO cursorDiskKV (key, value) SELECT key, value FROM bk.deleted",
         [],
@@ -311,8 +338,9 @@ pub fn restore(db_path: &Path, backup_path: &Path) -> Result<RestoreOutcome> {
                 )?;
             } else {
                 // workspace 库
-                let ws = Connection::open(&target_db)
-                    .with_context(|| format!("打开 workspace 库失败: {target_db}"))?;
+                let ws = Connection::open(&target_db).map_err(|source| {
+                    Error::OpenWorkspaceDb { path: PathBuf::from(&target_db), source }
+                })?;
                 ws.execute(
                     "INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?1, ?2)",
                     rusqlite::params![key, value],
@@ -367,6 +395,9 @@ mod tests {
             INSERT INTO cursorDiskKV VALUES ('composerVirtualRowHeights:dead1', '{}');
             -- 墓碑(value 为 NULL,归属存活会话也要删)
             INSERT INTO cursorDiskKV VALUES ('composerData:live2', NULL);
+            -- 非 composerData 前缀的 NULL 行: 官方没有写它的路径(6.3),
+            -- 收窄后的墓碑语义不再把它当墓碑,必须保留
+            INSERT INTO cursorDiskKV VALUES ('bubbleId:live1:tomb', NULL);
             -- 硬约束: 以下都不能碰
             INSERT INTO cursorDiskKV VALUES ('agentKv:blob:aabbcc', x'ff');
             INSERT INTO cursorDiskKV VALUES ('agentKv:artifact:x:/p', 'v');
@@ -400,6 +431,7 @@ mod tests {
                 "agentKv:artifact:x:/p",
                 "agentKv:blob:aabbcc",
                 "ai_hashes.2026-01-01",
+                "bubbleId:live1:tomb", // 非 composerData 的 NULL 行不是墓碑
                 "bubbleId:live2:b1",
                 "composer.composerHeaders.migratedToTable",
                 "composer.content.deadbeef",
@@ -426,7 +458,7 @@ mod tests {
         assert_eq!(restored.kv_rows, 6);
         assert_eq!(restored.header_rows, 0, "sweep 备份不含 header");
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM cursorDiskKV", [], |r| r.get(0)).unwrap();
-        assert_eq!(n, 13);
+        assert_eq!(n, 14, "8 保留(含 bubbleId NULL 行)+ 6 回灌");
         let t: String = conn
             .query_row("SELECT typeof(value) FROM cursorDiskKV WHERE key='composerData:dead1'", [], |r| r.get(0))
             .unwrap();
@@ -451,12 +483,34 @@ mod tests {
 
         // 维护模式零重扫的正确性基石: 扫描收集的待删清单必须与
         // sweep::plan 独立算出的清单逐项一致
-        let plan = plan(&conn, &live, false, &crate::progress::Progress::new()).unwrap();
+        let plan_fast = plan(&conn, &live, false, &crate::progress::Progress::new()).unwrap();
         let mut from_scan = scan.condemned_keys.clone();
-        let mut from_plan = plan.keys.clone();
+        let mut from_plan = plan_fast.keys.clone();
         from_scan.sort();
         from_plan.sort();
         assert_eq!(from_scan, from_plan, "condemned_keys 必须等价于 sweep::plan 的结果");
+
+        // 快/深两档除 bytes 外必须逐项一致(I/O 分层不改变语义)
+        let deep =
+            crate::scan::scan_keys(&conn, &live, true, true, &crate::progress::Progress::new())
+                .unwrap();
+        assert!(deep.sized && !scan.sized);
+        assert_eq!(deep.total_rows, scan.total_rows);
+        assert_eq!(deep.live_tombstone_rows, scan.live_tombstone_rows);
+        assert_eq!(deep.orphan_composers, scan.orphan_composers);
+        assert_eq!(deep.ghost_headers, scan.ghost_headers);
+        let mut deep_condemned = deep.condemned_keys.clone();
+        deep_condemned.sort();
+        assert_eq!(deep_condemned, from_scan, "两档待删清单必须一致");
+        let deep_rows: Vec<_> = deep.per_prefix.iter().map(|(k, s)| (*k, s.rows)).collect();
+        let fast_rows: Vec<_> = scan.per_prefix.iter().map(|(k, s)| (*k, s.rows)).collect();
+        assert_eq!(deep_rows, fast_rows);
+
+        let plan_deep = plan(&conn, &live, true, &crate::progress::Progress::new()).unwrap();
+        let mut deep_keys = plan_deep.keys.clone();
+        deep_keys.sort();
+        assert_eq!(deep_keys, from_plan, "sweep::plan 两档 key 清单必须一致");
+        assert_eq!(plan_deep.tombstone_rows, plan_fast.tombstone_rows);
 
         let _ = std::fs::remove_file(&db);
     }
@@ -469,10 +523,10 @@ mod tests {
         let holder = Connection::open(&db).unwrap();
         holder.execute_batch("BEGIN EXCLUSIVE").unwrap();
         let err = match apply(&db, false, &crate::progress::Progress::new()) {
-            Err(e) => e.to_string(),
+            Err(e) => e,
             Ok(_) => panic!("库被独占时 apply 应当失败"),
         };
-        assert!(err.contains("占用"), "实际错误: {err}");
+        assert!(matches!(err, Error::DbBusy), "实际错误: {}", err.render());
         holder.execute_batch("ROLLBACK").unwrap();
 
         let _ = std::fs::remove_file(&db);
